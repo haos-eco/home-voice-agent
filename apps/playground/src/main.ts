@@ -230,10 +230,19 @@ async function requestClientToken(): Promise<{
 }> {
   const response = await fetch(`${serverUrl}/api/realtime/token`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       Accept: 'application/json',
     },
   })
+
+  const contentType = response.headers.get('content-type') ?? ''
+
+  if (!contentType.includes('application/json')) {
+    throw new Error(
+      `Cloudflare Access authentication is required. Open ${serverUrl}/health in this browser, sign in, then retry.`,
+    )
+  }
 
   const payload = (await response.json()) as RealtimeTokenResponse
 
@@ -346,9 +355,6 @@ Assistant: Give practical step-by-step guidance.
         input: {
           noiseReduction: {
             type: 'far_field',
-          },
-          transcription: {
-            model: 'gpt-4o-transcribe',
           },
           turnDetection: {
             type: 'server_vad',
