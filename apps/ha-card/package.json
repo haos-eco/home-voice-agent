@@ -1,0 +1,19 @@
+{
+  "name": "@home-voice-agent/ha-card",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "dev": "vite build --watch"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.14.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0"
+  }
+}

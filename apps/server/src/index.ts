@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 
 import { verifyCloudflareAccess } from './cloudflare-access.js'
+import { verifyInternalSecret } from './internal-auth.js'
 import { config } from './config.js'
 import {
   createRealtimeClientSecret,
@@ -50,9 +51,11 @@ await app.register(rateLimit, {
 const checkRealtimeTokenRate = app.createRateLimit({
   max: 6,
   timeWindow: '1 minute',
-
   keyGenerator(request) {
-    return request.accessIdentity?.sub ?? request.ip
+    const header = request.headers['x-home-assistant-user-id']
+    const homeAssistantUserId = Array.isArray(header) ? header[0] : header
+
+    return homeAssistantUserId ?? request.accessIdentity?.sub ?? request.ip
   },
 })
 
@@ -78,6 +81,42 @@ async function enforceRealtimeTokenRate(
   })
 }
 
+async function issueRealtimeToken(
+  _request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<FastifyReply> {
+  reply.header('Cache-Control', 'no-store, private')
+
+  try {
+    const clientSecret = await createRealtimeClientSecret()
+    return reply.status(201).send(clientSecret)
+  } catch (error) {
+    if (error instanceof OpenAIConfigurationError) {
+      return reply.status(503).send({
+        error: 'openai_not_configured',
+        message: 'The OpenAI API key is not configured.',
+      })
+    }
+
+    if (error instanceof OpenAIRealtimeError) {
+      app.log.error(
+        {
+          statusCode: error.statusCode,
+          error: error.message,
+        },
+        'Failed to create Realtime credential',
+      )
+
+      return reply.status(502).send({
+        error: 'realtime_client_secret_failed',
+        message: 'Could not create a Realtime credential.',
+      })
+    }
+
+    throw error
+  }
+}
+
 app.get('/health', async () => ({
   status: 'ok',
   service: 'home-voice-agent-server',
@@ -92,38 +131,15 @@ app.post(
   {
     preHandler: [verifyCloudflareAccess, enforceRealtimeTokenRate],
   },
-  async (_request, reply) => {
-    reply.header('Cache-Control', 'no-store, private')
+  issueRealtimeToken,
+)
 
-    try {
-      const clientSecret = await createRealtimeClientSecret()
-      return reply.status(201).send(clientSecret)
-    } catch (error) {
-      if (error instanceof OpenAIConfigurationError) {
-        return reply.status(503).send({
-          error: 'openai_not_configured',
-          message: 'The OpenAI API key is not configured.',
-        })
-      }
-
-      if (error instanceof OpenAIRealtimeError) {
-        app.log.error(
-          {
-            statusCode: error.statusCode,
-            error: error.message,
-          },
-          'Failed to create OpenAI Realtime client secret',
-        )
-
-        return reply.status(502).send({
-          error: 'realtime_client_secret_failed',
-          message: 'Could not create a Realtime client secret.',
-        })
-      }
-
-      throw error
-    }
+app.post(
+  '/internal/realtime/token',
+  {
+    preHandler: [verifyInternalSecret, enforceRealtimeTokenRate],
   },
+  issueRealtimeToken,
 )
 
 app.setNotFoundHandler(async (_request, reply) =>

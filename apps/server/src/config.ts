@@ -28,6 +28,8 @@ const configSchema = z
 
     REALTIME_VOICE: z.string().min(1).default('marin'),
 
+    INTERNAL_API_SECRET: z.preprocess(emptyToUndefined, z.string().min(32).optional()),
+
     CLOUDFLARE_ACCESS_REQUIRED: z
       .enum(['true', 'false'])
       .default('false')
@@ -47,6 +49,14 @@ const configSchema = z
   .superRefine((value, context) => {
     if (!value.CLOUDFLARE_ACCESS_REQUIRED) {
       return
+    }
+
+    if (value.NODE_ENV === 'production' && !value.INTERNAL_API_SECRET) {
+      context.addIssue({
+        code: 'custom',
+        path: ['INTERNAL_API_SECRET'],
+        message: 'INTERNAL_API_SECRET is required in production.',
+      })
     }
 
     if (!value.CLOUDFLARE_TEAM_DOMAIN) {
