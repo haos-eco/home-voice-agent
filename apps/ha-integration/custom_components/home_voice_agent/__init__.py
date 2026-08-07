@@ -113,6 +113,7 @@ async def websocket_realtime_token(
         async with session.post(
             backend_url,
             headers=headers,
+            json={},
             timeout=ClientTimeout(total=15),
         ) as response:
             response_text = await response.text()

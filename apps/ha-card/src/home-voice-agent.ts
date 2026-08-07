@@ -8,6 +8,7 @@ import {
 export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
 
 type HassLike = {
+  callWS<T>(message: Record<string, unknown>): Promise<T>
   callService(
     domain: string,
     service: string,
@@ -16,7 +17,6 @@ type HassLike = {
 }
 
 type VoiceAgentConfig = {
-  serverUrl: string
   room: string
   deviceId: string
   stateEntity: string
@@ -34,7 +34,6 @@ type RealtimeTokenResponse = {
 }
 
 const DEFAULT_CONFIG: VoiceAgentConfig = {
-  serverUrl: 'https://ai.emmanuele.casa',
   room: 'unknown',
   deviceId: 'unknown-tablet',
   stateEntity: '',
@@ -100,14 +99,13 @@ export class HomeVoiceAgentController {
   private inactivityTimer: number | null = null
   private idleAfterErrorTimer: number | null = null
   private currentState: VoiceAgentState = 'idle'
+  private lastError: string | null = null
   private stopping = false
 
   public configure(partialConfig: Partial<VoiceAgentConfig>): void {
     this.config = {
       ...this.config,
       ...partialConfig,
-
-      serverUrl: (partialConfig.serverUrl ?? this.config.serverUrl).replace(/\/$/, ''),
     }
   }
 
@@ -131,6 +129,8 @@ export class HomeVoiceAgentController {
   }
 
   public async start(): Promise<void> {
+    this.lastError = null
+
     if (this.session || this.currentState === 'connecting') {
       return
     }
@@ -226,7 +226,7 @@ export class HomeVoiceAgentController {
       session.on('error', error => {
         console.error('[Home Voice Agent] Realtime error', error)
 
-        this.handleError()
+        this.handleError(error)
       })
 
       await session.connect({
@@ -235,7 +235,7 @@ export class HomeVoiceAgentController {
     } catch (error) {
       console.error('[Home Voice Agent] Connection failed', error)
 
-      this.handleError()
+      this.handleError(error)
     }
   }
 
@@ -263,45 +263,45 @@ export class HomeVoiceAgentController {
     return this.svgDataUrl(this.createIconSvg(state))
   }
 
+  public diagnostics(): {
+    state: VoiceAgentState
+    error: string | null
+    hasHass: boolean
+    hasSession: boolean
+  } {
+    return {
+      state: this.currentState,
+      error: this.lastError,
+      hasHass: Boolean(this.hass),
+      hasSession: Boolean(this.session),
+    }
+  }
+
   private async requestClientCredential(): Promise<{
     value: string
     model: string
   }> {
-    const response = await fetch(`${this.config.serverUrl}/api/realtime/token`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        Accept: 'application/json',
-      },
-    })
-
-    const contentType = response.headers.get('content-type') ?? ''
-
-    if (!contentType.includes('application/json')) {
-      throw new Error(`Cloudflare Access authentication is required for ${this.config.serverUrl}.`)
+    if (!this.hass) {
+      throw new Error('Home Assistant is not connected.')
     }
 
-    const payload = (await response.json()) as RealtimeTokenResponse
+    const payload = await this.hass.callWS<RealtimeTokenResponse>({
+      type: 'home_voice_agent/realtime_token',
+    })
 
-    if (!response.ok) {
+    if (typeof payload.value !== 'string' || payload.value.length === 0) {
       const message =
         typeof payload.message === 'string'
           ? payload.message
-          : `Token request failed with HTTP ${response.status}.`
+          : 'Home Assistant returned no Realtime credential.'
 
       throw new Error(message)
     }
 
-    if (typeof payload.value !== 'string' || payload.value.length === 0) {
-      throw new Error('The backend returned no Realtime credential.')
-    }
-
-    const model =
-      typeof payload.session?.model === 'string' ? payload.session.model : 'gpt-realtime-2.1'
-
     return {
       value: payload.value,
-      model,
+      model:
+        typeof payload.session?.model === 'string' ? payload.session.model : 'gpt-realtime-2.1',
     }
   }
 
@@ -368,7 +368,12 @@ export class HomeVoiceAgentController {
     this.idleAfterErrorTimer = null
   }
 
-  private handleError(): void {
+  private handleError(error?: unknown): void {
+    this.lastError =
+      error instanceof Error ? error.message : error ? String(error) : 'Unknown voice-agent error'
+
+    console.error('[Home Voice Agent]', this.lastError, error)
+
     this.clearInactivityTimer()
     this.releaseSession()
     this.setState('error')
@@ -377,7 +382,7 @@ export class HomeVoiceAgentController {
       if (this.currentState === 'error') {
         this.setState('idle')
       }
-    }, 3_000)
+    }, 8_000)
   }
 
   private releaseSession(): void {
