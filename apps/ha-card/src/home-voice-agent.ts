@@ -102,6 +102,7 @@ export class HomeVoiceAgentController {
   private idleAfterErrorTimer: number | null = null
   private currentState: VoiceAgentState = 'idle'
   private lastError: string | null = null
+  private hassInitiallyBound = false
   private stopping = false
 
   private readonly wakeWord: WakeWordStream
@@ -202,7 +203,12 @@ export class HomeVoiceAgentController {
 
   public bindHass(hass: HassLike): void {
     this.hass = hass
-    void this.publishState()
+
+    if (!this.hassInitiallyBound) {
+      this.hassInitiallyBound = true
+      void this.publishState()
+    }
+
     this.maybeBootstrapWakeWord()
   }
 
@@ -472,8 +478,11 @@ export class HomeVoiceAgentController {
     this.setState('error')
 
     this.idleAfterErrorTimer = window.setTimeout(() => {
+      this.idleAfterErrorTimer = null
+
       if (this.currentState === 'error') {
         this.setState('idle')
+        this.resumeWakeWord()
       }
     }, 8_000)
   }
