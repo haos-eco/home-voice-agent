@@ -1,0 +1,2 @@
+pyopen-wakeword==1.1.0
+websockets==15.0.1

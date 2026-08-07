@@ -5,6 +5,8 @@ import {
   type OpenAIRealtimeModels,
 } from '@openai/agents/realtime'
 
+import { WakeWordStream, type WakeDetection } from './wake-word-stream.js'
+
 export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
 
 type HassLike = {
@@ -102,17 +104,106 @@ export class HomeVoiceAgentController {
   private lastError: string | null = null
   private stopping = false
 
+  private readonly wakeWord: WakeWordStream
+  private wakeWordResumeTimer: number | null = null
+  private wakeWordEnabled = false
+  private wakeWordBootstrapRunning = false
+
+  public constructor() {
+    this.wakeWord = new WakeWordStream(async (detection: WakeDetection) => {
+      console.info('[Home Voice Agent] Activated by wake word:', detection.keyword, detection.score)
+      await this.start()
+    })
+  }
+
+  public async enableWakeWord(): Promise<void> {
+    if (this.wakeWord.isActive) {
+      this.wakeWordEnabled = true
+      return
+    }
+
+    this.wakeWordEnabled = true
+
+    if (
+      this.session ||
+      this.currentState === 'connecting' ||
+      this.currentState === 'listening' ||
+      this.currentState === 'speaking'
+    ) {
+      return
+    }
+
+    try {
+      await this.wakeWord.start({
+        room: this.config.room,
+        deviceId: this.config.deviceId,
+      })
+    } catch (error) {
+      this.wakeWordEnabled = false
+
+      console.error('[Home Voice Agent] Could not enable wake word', error)
+
+      throw error
+    }
+  }
+
+  private maybeBootstrapWakeWord(): void {
+    if (this.wakeWordBootstrapRunning || this.wakeWordEnabled) {
+      return
+    }
+
+    /*
+     * Android WebView / Fully.
+     *
+     * This deliberately prevents your Mac
+     * browser from becoming an always-on
+     * microphone whenever you open HA.
+     */
+    const isAndroidWebView = navigator.userAgent.includes('; wv)')
+
+    if (!isAndroidWebView) {
+      return
+    }
+
+    if (!this.hass) {
+      return
+    }
+
+    if (!this.config.room || !this.config.deviceId) {
+      return
+    }
+
+    this.wakeWordBootstrapRunning = true
+
+    void this.enableWakeWord()
+      .catch(error => {
+        console.error('[Home Voice Agent] ' + 'Automatic wake-word startup failed', error)
+      })
+      .finally(() => {
+        this.wakeWordBootstrapRunning = false
+      })
+  }
+
+  public async disableWakeWord(): Promise<void> {
+    this.wakeWordEnabled = false
+
+    this.clearWakeWordResumeTimer()
+
+    await this.wakeWord.stop()
+  }
+
   public configure(partialConfig: Partial<VoiceAgentConfig>): void {
     this.config = {
       ...this.config,
       ...partialConfig,
     }
+    this.maybeBootstrapWakeWord()
   }
 
   public bindHass(hass: HassLike): void {
     this.hass = hass
-
     void this.publishState()
+    this.maybeBootstrapWakeWord()
   }
 
   public get state(): VoiceAgentState {
@@ -134,6 +225,9 @@ export class HomeVoiceAgentController {
     if (this.session || this.currentState === 'connecting') {
       return
     }
+
+    this.clearWakeWordResumeTimer()
+    await this.wakeWord.stop()
 
     this.clearErrorTimer()
     this.setState('connecting')
@@ -193,6 +287,7 @@ export class HomeVoiceAgentController {
         if (connectionState === 'disconnected' && !this.stopping && this.session === session) {
           this.releaseSession()
           this.setState('idle')
+          this.resumeWakeWord()
         }
       })
 
@@ -248,6 +343,7 @@ export class HomeVoiceAgentController {
 
     this.setState('idle')
     this.stopping = false
+    this.resumeWakeWord()
   }
 
   public interrupt(): void {
@@ -366,6 +462,7 @@ export class HomeVoiceAgentController {
 
     window.clearTimeout(this.idleAfterErrorTimer)
     this.idleAfterErrorTimer = null
+    this.resumeWakeWord()
   }
 
   private handleError(error?: unknown): void {
@@ -420,152 +517,327 @@ export class HomeVoiceAgentController {
   }
 
   private createIconSvg(state: VoiceAgentState): string {
-    const start = `
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        viewBox="0 0 64 64"
+    const speaking = state === 'speaking'
+
+    const listening = state === 'listening'
+
+    const connecting = state === 'connecting'
+
+    const error = state === 'error'
+
+    const active = speaking || listening
+
+    const speed = speaking ? '1.05s' : listening ? '1.9s' : '4.2s'
+
+    return `
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="-10 -10 120 120"
+      overflow="visible"
+    >
+      <defs>
+        <radialGradient
+          id="hva-core"
+          cx="32%"
+          cy="25%"
+          r="85%"
+        >
+          <stop
+            offset="0%"
+            stop-color="#ffffff"
+          />
+
+          <stop
+            offset="15%"
+            stop-color="#8ff3ff"
+          />
+
+          <stop
+            offset="38%"
+            stop-color="#657cff"
+          />
+
+          <stop
+            offset="61%"
+            stop-color="#ad63ed"
+          />
+
+          <stop
+            offset="82%"
+            stop-color="#f16cb8"
+          />
+
+          <stop
+            offset="100%"
+            stop-color="#ffad73"
+          />
+        </radialGradient>
+
+        <linearGradient
+          id="hva-ring"
+          x1="0%"
+          y1="0%"
+          x2="100%"
+          y2="100%"
+        >
+          <stop
+            offset="0%"
+            stop-color="#65edff"
+          />
+
+          <stop
+            offset="28%"
+            stop-color="#6875ff"
+          />
+
+          <stop
+            offset="59%"
+            stop-color="#bd68ec"
+          />
+
+          <stop
+            offset="81%"
+            stop-color="#fa73b5"
+          />
+
+          <stop
+            offset="100%"
+            stop-color="#ffbd75"
+          />
+        </linearGradient>
+
+        <filter
+          id="hva-glow"
+          x="-60%"
+          y="-60%"
+          width="220%"
+          height="220%"
+        >
+          <feGaussianBlur
+            stdDeviation="${active ? '4' : '2.5'}"
+            result="blur"
+          />
+
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode
+              in="SourceGraphic"
+            />
+          </feMerge>
+        </filter>
+      </defs>
+
+      <!-- ambient halo -->
+
+      <circle
+        cx="50"
+        cy="50"
+        r="39"
+        fill="${error ? '#ff5368' : '#707cff'}"
+        opacity="${error ? '.22' : active ? '.17' : '.07'}"
       >
-        <defs>
-          <radialGradient id="idle" cx="35%" cy="28%">
-            <stop offset="0%" stop-color="#9fb9d5"/>
-            <stop offset="48%" stop-color="#566a84"/>
-            <stop offset="100%" stop-color="#252c38"/>
-          </radialGradient>
-
-          <linearGradient id="voice" x1="0%" y1="20%" x2="100%" y2="80%">
-            <stop offset="0%" stop-color="#50d8ff"/>
-            <stop offset="35%" stop-color="#8275ff"/>
-            <stop offset="68%" stop-color="#ff6cbd"/>
-            <stop offset="100%" stop-color="#ffba58"/>
-          </linearGradient>
-        </defs>
-    `
-
-    if (state === 'connecting') {
-      return `${start}
-        <circle cx="32" cy="32" r="18" fill="url(#idle)" opacity=".75"/>
-        <circle cx="32" cy="32" r="19" fill="none" stroke="#d6ae61" stroke-width="3">
-          <animate
-            attributeName="r"
-            values="18;27;18"
-            dur="1.25s"
-            repeatCount="indefinite"
-          />
-          <animate
-            attributeName="opacity"
-            values="1;0;1"
-            dur="1.25s"
-            repeatCount="indefinite"
-          />
-        </circle>
-      </svg>`
-    }
-
-    if (state === 'listening') {
-      return `${start}
-        <circle cx="32" cy="32" r="25" fill="url(#idle)"/>
-
-        <g fill="#dff6ff">
-          <rect x="19" y="25" width="5" height="14" rx="2.5">
-            <animate
-              attributeName="height"
-              values="10;24;10"
-              dur=".9s"
-              repeatCount="indefinite"
-            />
-            <animate
-              attributeName="y"
-              values="27;20;27"
-              dur=".9s"
-              repeatCount="indefinite"
-            />
-          </rect>
-
-          <rect x="29.5" y="20" width="5" height="24" rx="2.5">
-            <animate
-              attributeName="height"
-              values="24;12;24"
-              dur=".72s"
-              repeatCount="indefinite"
-            />
-            <animate
-              attributeName="y"
-              values="20;26;20"
-              dur=".72s"
-              repeatCount="indefinite"
-            />
-          </rect>
-
-          <rect x="40" y="25" width="5" height="14" rx="2.5">
-            <animate
-              attributeName="height"
-              values="12;22;12"
-              dur="1.05s"
-              repeatCount="indefinite"
-            />
-            <animate
-              attributeName="y"
-              values="26;21;26"
-              dur="1.05s"
-              repeatCount="indefinite"
-            />
-          </rect>
-        </g>
-      </svg>`
-    }
-
-    if (state === 'speaking') {
-      return `${start}
-        <circle cx="32" cy="32" r="25" fill="#141824"/>
-
-        <circle cx="32" cy="32" r="14" fill="none" stroke="url(#voice)" stroke-width="6">
-          <animate
-            attributeName="r"
-            values="11;18;13;20;11"
-            dur="1.35s"
-            repeatCount="indefinite"
-          />
-          <animate
-            attributeName="stroke-width"
-            values="7;3;6;2;7"
-            dur="1.35s"
-            repeatCount="indefinite"
-          />
-        </circle>
-
-        <circle cx="32" cy="32" r="23" fill="none" stroke="url(#voice)" stroke-width="2" opacity=".65">
-          <animate
-            attributeName="r"
-            values="20;27;21;25;20"
-            dur="1.7s"
-            repeatCount="indefinite"
-          />
-          <animate
-            attributeName="opacity"
-            values=".75;.2;.65;.25;.75"
-            dur="1.7s"
-            repeatCount="indefinite"
-          />
-        </circle>
-      </svg>`
-    }
-
-    if (state === 'error') {
-      return `${start}
-        <circle cx="32" cy="32" r="25" fill="#6a252b"/>
-        <path
-          d="M23 23 41 41M41 23 23 41"
-          fill="none"
-          stroke="#ffd8dc"
-          stroke-width="5"
-          stroke-linecap="round"
+        <animate
+          attributeName="r"
+          values="${active ? '36;44;38;42;36' : '37;40;37'}"
+          dur="${speed}"
+          repeatCount="indefinite"
         />
-      </svg>`
+      </circle>
+
+      <g filter="url(#hva-glow)">
+
+        <!-- main liquid body -->
+
+        <circle
+          cx="50"
+          cy="50"
+          r="${speaking ? '30' : '28'}"
+          fill="url(#hva-core)"
+        >
+          <animate
+            attributeName="r"
+            values="${
+              speaking ? '26;33;28;31;25;30;26' : listening ? '27;30;28;31;27' : '27;28.5;27'
+            }"
+            dur="${speed}"
+            repeatCount="indefinite"
+          />
+        </circle>
+
+        ${
+          active
+            ? `
+              <ellipse
+                cx="40"
+                cy="42"
+                rx="19"
+                ry="14"
+                fill="#5feaff"
+                opacity=".34"
+              >
+                <animate
+                  attributeName="cx"
+                  values="38;54;45;38"
+                  dur="${speed}"
+                  repeatCount="indefinite"
+                />
+
+                <animate
+                  attributeName="ry"
+                  values="12;19;14;12"
+                  dur="${speed}"
+                  repeatCount="indefinite"
+                />
+              </ellipse>
+
+              <ellipse
+                cx="60"
+                cy="60"
+                rx="18"
+                ry="15"
+                fill="#fa68c0"
+                opacity=".30"
+              >
+                <animate
+                  attributeName="cx"
+                  values="62;47;57;62"
+                  dur="${speed}"
+                  repeatCount="indefinite"
+                />
+
+                <animate
+                  attributeName="rx"
+                  values="15;22;18;15"
+                  dur="${speed}"
+                  repeatCount="indefinite"
+                />
+              </ellipse>
+
+              <ellipse
+                cx="52"
+                cy="39"
+                rx="15"
+                ry="11"
+                fill="#816cff"
+                opacity=".22"
+              >
+                <animate
+                  attributeName="cy"
+                  values="36;51;40;36"
+                  dur="${speed}"
+                  repeatCount="indefinite"
+                />
+              </ellipse>
+            `
+            : ''
+        }
+
+        <!-- luminous outer edge -->
+
+        <circle
+          cx="50"
+          cy="50"
+          r="33"
+          fill="none"
+          stroke="url(#hva-ring)"
+          stroke-width="${speaking ? '3.5' : '2.3'}"
+          opacity=".88"
+        >
+          <animate
+            attributeName="r"
+            values="${active ? '31;35;32;34;31' : '32;33;32'}"
+            dur="${speed}"
+            repeatCount="indefinite"
+          />
+
+          <animate
+            attributeName="opacity"
+            values=".92;.48;.82;.60;.92"
+            dur="${speed}"
+            repeatCount="indefinite"
+          />
+        </circle>
+
+      </g>
+
+      ${
+        connecting
+          ? `
+            <circle
+              cx="50"
+              cy="50"
+              r="42"
+              fill="none"
+              stroke="url(#hva-ring)"
+              stroke-width="3"
+              stroke-linecap="round"
+              stroke-dasharray="27 240"
+            >
+              <animateTransform
+                attributeName="transform"
+                type="rotate"
+                from="0 50 50"
+                to="360 50 50"
+                dur=".8s"
+                repeatCount="indefinite"
+              />
+            </circle>
+          `
+          : ''
+      }
+
+      ${
+        error
+          ? `
+            <circle
+              cx="50"
+              cy="50"
+              r="35"
+              fill="#ff4f67"
+              opacity=".15"
+            >
+              <animate
+                attributeName="opacity"
+                values=".08;.34;.08"
+                dur=".9s"
+                repeatCount="indefinite"
+              />
+            </circle>
+          `
+          : ''
+      }
+    </svg>
+  `
+  }
+
+  private clearWakeWordResumeTimer(): void {
+    if (this.wakeWordResumeTimer === null) return
+    window.clearTimeout(this.wakeWordResumeTimer)
+    this.wakeWordResumeTimer = null
+  }
+
+  private resumeWakeWord(): void {
+    this.clearWakeWordResumeTimer()
+
+    if (!this.wakeWordEnabled || this.session || this.currentState !== 'idle') {
+      return
     }
 
-    return `${start}
-      <circle cx="32" cy="32" r="25" fill="url(#idle)"/>
-      <circle cx="32" cy="32" r="7" fill="#dce9f6" opacity=".9"/>
-    </svg>`
+    this.wakeWordResumeTimer = window.setTimeout(() => {
+      this.wakeWordResumeTimer = null
+
+      if (!this.wakeWordEnabled || this.session || this.currentState !== 'idle') {
+        return
+      }
+
+      void this.wakeWord
+        .start({
+          room: this.config.room,
+          deviceId: this.config.deviceId,
+        })
+        .catch(error => {
+          console.error('[Home Voice Agent] ' + 'Could not resume wake listener', error)
+        })
+    }, 500)
   }
 }
