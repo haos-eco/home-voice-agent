@@ -456,13 +456,9 @@ export class HomeVoiceAgentController {
   }
 
   private clearErrorTimer(): void {
-    if (this.idleAfterErrorTimer === null) {
-      return
-    }
-
+    if (this.idleAfterErrorTimer === null) return
     window.clearTimeout(this.idleAfterErrorTimer)
     this.idleAfterErrorTimer = null
-    this.resumeWakeWord()
   }
 
   private handleError(error?: unknown): void {
