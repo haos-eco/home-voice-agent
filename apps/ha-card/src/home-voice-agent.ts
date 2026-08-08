@@ -21,6 +21,7 @@ type VoiceAgentConfig = {
   deviceId: string
   stateEntity: string
   inactivityMs: number
+  maxSessionMs: number
 }
 
 type RealtimeTokenResponse = {
@@ -36,6 +37,7 @@ const DEFAULT_CONFIG: VoiceAgentConfig = {
   deviceId: '',
   stateEntity: '',
   inactivityMs: 90_000,
+  maxSessionMs: 60_000,
 }
 
 const AGENT_INSTRUCTIONS = `
@@ -96,6 +98,7 @@ export class HomeVoiceAgentController {
   private session: RealtimeSession | null = null
   private audioElement: HTMLAudioElement | null = null
   private inactivityTimer: number | null = null
+  private maxSessionTimer: number | null = null
   private idleAfterErrorTimer: number | null = null
   private currentState: VoiceAgentState = 'idle'
   private lastError: string | null = null
@@ -196,6 +199,7 @@ export class HomeVoiceAgentController {
           void this.setupBoostedAudio(audioElement)
           this.setState('listening')
           this.resetInactivityTimer()
+          this.startMaxSessionTimer()
           return
         }
 
@@ -281,6 +285,9 @@ export class HomeVoiceAgentController {
       room: this.config.room,
       deviceId: this.config.deviceId,
       stateEntity: this.config.stateEntity,
+      inactivityMs: this.config.inactivityMs,
+      maxSessionMs: this.config.maxSessionMs,
+      maxSessionTimerActive: this.maxSessionTimer !== null,
     }
   }
 
@@ -366,6 +373,26 @@ export class HomeVoiceAgentController {
     this.inactivityTimer = null
   }
 
+  private startMaxSessionTimer(): void {
+    this.clearMaxSessionTimer()
+
+    this.maxSessionTimer = window.setTimeout(() => {
+      this.maxSessionTimer = null
+      console.info('[Home Voice Agent] Maximum session duration reached')
+
+      this.stop()
+    }, this.config.maxSessionMs)
+  }
+
+  private clearMaxSessionTimer(): void {
+    if (this.maxSessionTimer === null) {
+      return
+    }
+
+    window.clearTimeout(this.maxSessionTimer)
+    this.maxSessionTimer = null
+  }
+
   private clearErrorTimer(): void {
     if (this.idleAfterErrorTimer === null) return
     window.clearTimeout(this.idleAfterErrorTimer)
@@ -392,6 +419,8 @@ export class HomeVoiceAgentController {
   }
 
   private releaseSession(): void {
+    this.clearMaxSessionTimer()
+
     const session = this.session
     const audioElement = this.audioElement
     const audioContext = this.audioContext
