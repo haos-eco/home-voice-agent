@@ -27,17 +27,15 @@ type VoiceAgentConfig = {
 
 type RealtimeTokenResponse = {
   value?: unknown
-
   session?: {
     model?: unknown
   }
-
   message?: unknown
 }
 
 const DEFAULT_CONFIG: VoiceAgentConfig = {
-  room: 'unknown',
-  deviceId: 'unknown-tablet',
+  room: '',
+  deviceId: '',
   stateEntity: '',
   inactivityMs: 90_000,
 }
@@ -53,7 +51,8 @@ interface.
 
 # Language
 
-- Respond in the same language currently used by the user.
+- Your language is Italian. Always respond in Italian, unless the user explicitly requests another language. 
+  If the user switches to another language, continue in that language until the user switches back to Italian.
 
 # Response Length
 
@@ -105,10 +104,15 @@ export class HomeVoiceAgentController {
   private hassInitiallyBound = false
   private stopping = false
 
+  private audioContext: AudioContext | null = null
+  private audioSource: MediaStreamAudioSourceNode | null = null
+  private audioGain: GainNode | null = null
+  private audioCompressor: DynamicsCompressorNode | null = null
+
   private readonly wakeWord: WakeWordStream
   private wakeWordResumeTimer: number | null = null
+  private wakeWordBootstrapTimer: number | null = null
   private wakeWordEnabled = false
-  private wakeWordBootstrapRunning = false
 
   public constructor() {
     this.wakeWord = new WakeWordStream(async (detection: WakeDetection) => {
@@ -118,19 +122,13 @@ export class HomeVoiceAgentController {
   }
 
   public async enableWakeWord(): Promise<void> {
-    if (this.wakeWord.isActive) {
-      this.wakeWordEnabled = true
-      return
-    }
-
     this.wakeWordEnabled = true
 
-    if (
-      this.session ||
-      this.currentState === 'connecting' ||
-      this.currentState === 'listening' ||
-      this.currentState === 'speaking'
-    ) {
+    if (!this.config.room || !this.config.deviceId) {
+      throw new Error('Voice agent room/device configuration is missing.')
+    }
+
+    if (this.session || this.currentState !== 'idle') {
       return
     }
 
@@ -140,49 +138,9 @@ export class HomeVoiceAgentController {
         deviceId: this.config.deviceId,
       })
     } catch (error) {
-      this.wakeWordEnabled = false
-
-      console.error('[Home Voice Agent] Could not enable wake word', error)
-
+      console.error('[Home Voice Agent] Could not start wake listener', error)
       throw error
     }
-  }
-
-  private maybeBootstrapWakeWord(): void {
-    if (this.wakeWordBootstrapRunning || this.wakeWordEnabled) {
-      return
-    }
-
-    /*
-     * Android WebView / Fully.
-     *
-     * This deliberately prevents your Mac
-     * browser from becoming an always-on
-     * microphone whenever you open HA.
-     */
-    const isAndroidWebView = navigator.userAgent.includes('; wv)')
-
-    if (!isAndroidWebView) {
-      return
-    }
-
-    if (!this.hass) {
-      return
-    }
-
-    if (!this.config.room || !this.config.deviceId) {
-      return
-    }
-
-    this.wakeWordBootstrapRunning = true
-
-    void this.enableWakeWord()
-      .catch(error => {
-        console.error('[Home Voice Agent] ' + 'Automatic wake-word startup failed', error)
-      })
-      .finally(() => {
-        this.wakeWordBootstrapRunning = false
-      })
   }
 
   public async disableWakeWord(): Promise<void> {
@@ -198,7 +156,8 @@ export class HomeVoiceAgentController {
       ...this.config,
       ...partialConfig,
     }
-    this.maybeBootstrapWakeWord()
+
+    this.scheduleWakeWordBootstrap()
   }
 
   public bindHass(hass: HassLike): void {
@@ -209,7 +168,7 @@ export class HomeVoiceAgentController {
       void this.publishState()
     }
 
-    this.maybeBootstrapWakeWord()
+    this.scheduleWakeWordBootstrap()
   }
 
   public get state(): VoiceAgentState {
@@ -285,6 +244,7 @@ export class HomeVoiceAgentController {
 
       session.transport.on('connection_change', connectionState => {
         if (connectionState === 'connected') {
+          void this.setupBoostedAudio(audioElement)
           this.setState('listening')
           this.resetInactivityTimer()
           return
@@ -365,17 +325,18 @@ export class HomeVoiceAgentController {
     return this.svgDataUrl(this.createIconSvg(state))
   }
 
-  public diagnostics(): {
-    state: VoiceAgentState
-    error: string | null
-    hasHass: boolean
-    hasSession: boolean
-  } {
+  public diagnostics() {
     return {
       state: this.currentState,
       error: this.lastError,
       hasHass: Boolean(this.hass),
       hasSession: Boolean(this.session),
+      room: this.config.room,
+      deviceId: this.config.deviceId,
+      stateEntity: this.config.stateEntity,
+      wakeWordEnabled: this.wakeWordEnabled,
+      wakeWordActive: this.wakeWord.isActive,
+      wakeWordBootstrapScheduled: this.wakeWordBootstrapTimer !== null,
     }
   }
 
@@ -490,9 +451,15 @@ export class HomeVoiceAgentController {
   private releaseSession(): void {
     const session = this.session
     const audioElement = this.audioElement
+    const audioContext = this.audioContext
 
     this.session = null
     this.audioElement = null
+
+    this.audioContext = null
+    this.audioSource = null
+    this.audioGain = null
+    this.audioCompressor = null
 
     try {
       session?.close()
@@ -504,6 +471,12 @@ export class HomeVoiceAgentController {
       audioElement.pause()
       audioElement.srcObject = null
       audioElement.removeAttribute('src')
+    }
+
+    if (audioContext) {
+      void audioContext.close().catch(error => {
+        console.warn('[Home Voice Agent] Error closing audio context', error)
+      })
     }
   }
 
@@ -815,6 +788,51 @@ export class HomeVoiceAgentController {
   `
   }
 
+  private scheduleWakeWordBootstrap(): void {
+    if (!this.hass) return
+
+    if (!this.config.room || !this.config.deviceId) return
+
+    if (this.session || this.currentState !== 'idle' || this.wakeWord.isActive) {
+      return
+    }
+
+    if (this.wakeWordBootstrapTimer !== null) return
+
+    console.info('[Home Voice Agent] Scheduling wake listener startup', {
+      room: this.config.room,
+      deviceId: this.config.deviceId,
+    })
+
+    this.wakeWordBootstrapTimer = window.setTimeout(() => {
+      this.wakeWordBootstrapTimer = null
+
+      if (
+        !this.hass ||
+        !this.config.room ||
+        !this.config.deviceId ||
+        this.session ||
+        this.currentState !== 'idle' ||
+        this.wakeWord.isActive
+      ) {
+        return
+      }
+
+      console.info('[Home Voice Agent] Starting wake listener', {
+        room: this.config.room,
+        deviceId: this.config.deviceId,
+      })
+
+      void this.enableWakeWord().catch(error => {
+        console.error('[Home Voice Agent] Automatic wake startup failed', error)
+
+        window.setTimeout(() => {
+          this.scheduleWakeWordBootstrap()
+        }, 2_000)
+      })
+    }, 1_500)
+  }
+
   private clearWakeWordResumeTimer(): void {
     if (this.wakeWordResumeTimer === null) return
     window.clearTimeout(this.wakeWordResumeTimer)
@@ -844,5 +862,51 @@ export class HomeVoiceAgentController {
           console.error('[Home Voice Agent] ' + 'Could not resume wake listener', error)
         })
     }, 500)
+  }
+
+  private async setupBoostedAudio(audioElement: HTMLAudioElement): Promise<void> {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (audioElement.srcObject instanceof MediaStream) {
+        break
+      }
+
+      await new Promise(resolve => window.setTimeout(resolve, 100))
+    }
+
+    const srcObject = audioElement.srcObject
+
+    if (!(srcObject instanceof MediaStream)) {
+      console.warn('[Home Voice Agent] Remote audio MediaStream not available')
+      return
+    }
+
+    const audioContext = new AudioContext({
+      latencyHint: 'interactive',
+    })
+
+    const source = audioContext.createMediaStreamSource(srcObject)
+    const gain = audioContext.createGain()
+    const compressor = audioContext.createDynamicsCompressor()
+
+    gain.gain.value = 6
+
+    compressor.threshold.value = -10
+    compressor.knee.value = 12
+    compressor.ratio.value = 8
+    compressor.attack.value = 0.003
+    compressor.release.value = 0.2
+
+    source.connect(gain)
+    gain.connect(compressor)
+    compressor.connect(audioContext.destination)
+
+    audioElement.muted = true
+
+    await audioContext.resume()
+
+    this.audioContext = audioContext
+    this.audioSource = source
+    this.audioGain = gain
+    this.audioCompressor = compressor
   }
 }
