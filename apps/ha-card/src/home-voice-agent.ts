@@ -7,6 +7,12 @@ import {
 
 export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
 
+export type VoiceAgentStartOptions = {
+  inputReady?: boolean
+}
+
+type PrepareInputHook = () => Promise<void> | void
+
 type HassLike = {
   callWS<T>(message: Record<string, unknown>): Promise<T>
   callService(
@@ -53,6 +59,16 @@ interface.
 
 - Your language is Italian. Always respond in Italian, unless the user explicitly requests another language. 
   If the user switches to another language, continue in that language until the user switches back to Italian.
+
+# Voice Style
+
+- Speak with natural Italian rhythm and intonation.
+- Sound relaxed, warm, and conversational, like a person speaking nearby.
+- Avoid an announcer, narrator, call-center, or synthetic assistant cadence.
+- Use subtle variation in pitch, emphasis, and pacing.
+- Allow brief natural pauses where a person would pause.
+- Do not over-enunciate words or make every sentence sound equally emphatic.
+- Keep short replies fluid and spontaneous rather than clipped or robotic.
 
 # Response Length
 
@@ -102,6 +118,7 @@ export class HomeVoiceAgentController {
   private idleAfterErrorTimer: number | null = null
   private currentState: VoiceAgentState = 'idle'
   private lastError: string | null = null
+  private prepareInputHook: PrepareInputHook | null = null
   private hassInitiallyBound = false
   private stopping = false
 
@@ -109,6 +126,11 @@ export class HomeVoiceAgentController {
   private audioSource: MediaStreamAudioSourceNode | null = null
   private audioGain: GainNode | null = null
   private audioCompressor: DynamicsCompressorNode | null = null
+  private audioOutputGain: GainNode | null = null
+
+  public setPrepareInputHook(hook: PrepareInputHook | null): void {
+    this.prepareInputHook = hook
+  }
 
   public configure(partialConfig: Partial<VoiceAgentConfig>): void {
     this.config = {
@@ -139,7 +161,7 @@ export class HomeVoiceAgentController {
     await this.start()
   }
 
-  public async start(): Promise<void> {
+  public async start(options: VoiceAgentStartOptions = {}): Promise<void> {
     this.lastError = null
 
     if (this.session || this.currentState === 'connecting') {
@@ -150,6 +172,10 @@ export class HomeVoiceAgentController {
     this.setState('connecting')
 
     try {
+      if (!options.inputReady && this.prepareInputHook) {
+        await this.prepareInputHook()
+      }
+
       const credential = await this.requestClientCredential()
 
       const audioElement = document.createElement('audio')
@@ -161,6 +187,7 @@ export class HomeVoiceAgentController {
 
       const agent = new RealtimeAgent({
         name: 'Dona',
+        voice: 'marin',
         instructions: AGENT_INSTRUCTIONS,
       })
 
@@ -178,13 +205,15 @@ export class HomeVoiceAgentController {
                 type: 'far_field',
               },
               turnDetection: {
-                type: 'server_vad',
-                threshold: 0.72,
-                prefixPaddingMs: 300,
-                silenceDurationMs: 1_000,
+                type: 'semantic_vad',
+                eagerness: 'medium',
                 createResponse: true,
                 interruptResponse: true,
               },
+            },
+            output: {
+              voice: 'marin',
+              speed: 0.96,
             },
           },
         },
@@ -268,7 +297,7 @@ export class HomeVoiceAgentController {
   }
 
   /**
-   * Returns an animated SVG data URL for navbar-card.
+   * Returns an animated, theme-aware glass SVG data URL for navbar-card.
    */
   public icon(requestedState?: string): string {
     const state = this.isVoiceAgentState(requestedState) ? requestedState : this.currentState
@@ -432,6 +461,7 @@ export class HomeVoiceAgentController {
     this.audioSource = null
     this.audioGain = null
     this.audioCompressor = null
+    this.audioOutputGain = null
 
     try {
       session?.close()
@@ -462,302 +492,285 @@ export class HomeVoiceAgentController {
     )
   }
 
+  private themeVar(name: string, fallback: string): string {
+    const root = document.querySelector('home-assistant') ?? document.documentElement
+    const value = getComputedStyle(root).getPropertyValue(name).trim()
+    return value || fallback
+  }
+
   private svgDataUrl(svg: string): string {
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
   }
 
   private createIconSvg(state: VoiceAgentState): string {
+    const primary = this.themeVar('--primary-color', '#7c8cff')
+    const accent = this.themeVar('--accent-color', primary)
+    const text = this.themeVar('--primary-text-color', '#ffffff')
+    const secondary = this.themeVar('--secondary-text-color', '#a9b2c3')
+    const card = this.themeVar('--card-background-color', '#111722')
+    const success = this.themeVar('--success-color', '#4fd18b')
+    const errorColor = this.themeVar('--error-color', '#ff6178')
+
     const speaking = state === 'speaking'
-
     const listening = state === 'listening'
-
     const connecting = state === 'connecting'
-
     const error = state === 'error'
+    const active = speaking || listening || connecting
 
-    const active = speaking || listening
+    const stateColor = error
+      ? errorColor
+      : speaking
+        ? success
+        : listening
+          ? accent
+          : connecting
+            ? primary
+            : accent
 
-    const speed = speaking ? '1.05s' : listening ? '1.9s' : '4.2s'
+    const haloColor = speaking ? success : error ? errorColor : accent
+    const pulseDuration = speaking ? '1.05s' : listening ? '1.45s' : connecting ? '1.2s' : '5.5s'
 
-    return `
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="-10 -10 120 120"
-      overflow="visible"
-    >
-      <defs>
-        <radialGradient
-          id="hva-core"
-          cx="32%"
-          cy="25%"
-          r="85%"
-        >
-          <stop
-            offset="0%"
-            stop-color="#ffffff"
-          />
+    const idleWave = `
+      <ellipse cx="50" cy="50" rx="7.5" ry="7.5" fill="#ffffff" fill-opacity=".09"/>
+      <circle cx="50" cy="50" r="3.6" fill="${text}" fill-opacity=".94"/>
+    `
 
-          <stop
-            offset="15%"
-            stop-color="#8ff3ff"
-          />
-
-          <stop
-            offset="38%"
-            stop-color="#657cff"
-          />
-
-          <stop
-            offset="61%"
-            stop-color="#ad63ed"
-          />
-
-          <stop
-            offset="82%"
-            stop-color="#f16cb8"
-          />
-
-          <stop
-            offset="100%"
-            stop-color="#ffad73"
-          />
-        </radialGradient>
-
-        <linearGradient
-          id="hva-ring"
-          x1="0%"
-          y1="0%"
-          x2="100%"
-          y2="100%"
-        >
-          <stop
-            offset="0%"
-            stop-color="#65edff"
-          />
-
-          <stop
-            offset="28%"
-            stop-color="#6875ff"
-          />
-
-          <stop
-            offset="59%"
-            stop-color="#bd68ec"
-          />
-
-          <stop
-            offset="81%"
-            stop-color="#fa73b5"
-          />
-
-          <stop
-            offset="100%"
-            stop-color="#ffbd75"
-          />
-        </linearGradient>
-
-        <filter
-          id="hva-glow"
-          x="-60%"
-          y="-60%"
-          width="220%"
-          height="220%"
-        >
-          <feGaussianBlur
-            stdDeviation="${active ? '4' : '2.5'}"
-            result="blur"
-          />
-
-          <feMerge>
-            <feMergeNode in="blur" />
-            <feMergeNode
-              in="SourceGraphic"
-            />
-          </feMerge>
-        </filter>
-      </defs>
-
-      <!-- ambient halo -->
-
-      <circle
-        cx="50"
-        cy="50"
-        r="39"
-        fill="${error ? '#ff5368' : '#707cff'}"
-        opacity="${error ? '.22' : active ? '.17' : '.07'}"
+    const listeningWave = `
+      <path
+        d="M27 50
+           C33 46, 37 44, 42 50
+           C46 55, 50 57, 54 50
+           C58 44, 63 46, 73 50"
+        fill="none"
+        stroke="${text}"
+        stroke-width="3.1"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity=".96"
       >
         <animate
-          attributeName="r"
-          values="${active ? '36;44;38;42;36' : '37;40;37'}"
-          dur="${speed}"
+          attributeName="d"
+          dur="1.3s"
           repeatCount="indefinite"
+          values="
+            M27 50 C33 46, 37 44, 42 50 C46 55, 50 57, 54 50 C58 44, 63 46, 73 50;
+            M27 50 C33 43, 37 40, 42 50 C46 60, 50 62, 54 50 C58 40, 63 43, 73 50;
+            M27 50 C33 47, 37 46, 42 50 C46 53, 50 55, 54 50 C58 46, 63 47, 73 50;
+            M27 50 C33 46, 37 44, 42 50 C46 55, 50 57, 54 50 C58 44, 63 46, 73 50
+          "
         />
-      </circle>
+      </path>
+    `
 
-      <g filter="url(#hva-glow)">
+    const speakingWave = `
+      <path
+        d="M24 50
+           C30 50, 33 38, 38 38
+           C43 38, 44 61, 49 61
+           C54 61, 55 33, 61 33
+           C66 33, 67 66, 72 66
+           C76 66, 78 48, 82 48"
+        fill="none"
+        stroke="${text}"
+        stroke-width="3.2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity=".98"
+      >
+        <animate
+          attributeName="d"
+          dur=".92s"
+          repeatCount="indefinite"
+          values="
+            M24 50 C30 50, 33 38, 38 38 C43 38, 44 61, 49 61 C54 61, 55 33, 61 33 C66 33, 67 66, 72 66 C76 66, 78 48, 82 48;
+            M24 50 C30 50, 33 44, 38 44 C43 44, 44 56, 49 56 C54 56, 55 40, 61 40 C66 40, 67 59, 72 59 C76 59, 78 49, 82 49;
+            M24 50 C30 50, 33 34, 38 34 C43 34, 44 64, 49 64 C54 64, 55 28, 61 28 C66 28, 67 71, 72 71 C76 71, 78 46, 82 46;
+            M24 50 C30 50, 33 38, 38 38 C43 38, 44 61, 49 61 C54 61, 55 33, 61 33 C66 33, 67 66, 72 66 C76 66, 78 48, 82 48
+          "
+        />
+      </path>
+    `
 
-        <!-- main liquid body -->
-
-        <circle
-          cx="50"
-          cy="50"
-          r="${speaking ? '30' : '28'}"
-          fill="url(#hva-core)"
-        >
-          <animate
-            attributeName="r"
-            values="${
-              speaking ? '26;33;28;31;25;30;26' : listening ? '27;30;28;31;27' : '27;28.5;27'
-            }"
-            dur="${speed}"
-            repeatCount="indefinite"
-          />
+    const connectingWave = `
+      <g fill="${text}" opacity=".95">
+        <circle cx="40" cy="50" r="3.2">
+          <animate attributeName="opacity" values=".25;1;.25" dur="1s" repeatCount="indefinite"/>
         </circle>
+        <circle cx="50" cy="50" r="3.2">
+          <animate attributeName="opacity" values=".25;1;.25" dur="1s" begin=".16s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="60" cy="50" r="3.2">
+          <animate attributeName="opacity" values=".25;1;.25" dur="1s" begin=".32s" repeatCount="indefinite"/>
+        </circle>
+      </g>
+    `
+
+    const errorWave = `
+      <g stroke="${text}" stroke-width="3.6" stroke-linecap="round" opacity=".96">
+        <path d="M42 42 L58 58"/>
+        <path d="M58 42 L42 58"/>
+      </g>
+    `
+
+    const stateVisual = error
+      ? errorWave
+      : speaking
+        ? speakingWave
+        : listening
+          ? listeningWave
+          : connecting
+            ? connectingWave
+            : idleWave
+
+    return `
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="-10 -10 120 120"
+        overflow="visible"
+      >
+        <defs>
+          <radialGradient id="hva-v2-core" cx="50%" cy="42%" r="58%">
+            <stop offset="0%" stop-color="#ffffff" stop-opacity=".22"/>
+            <stop offset="28%" stop-color="${stateColor}" stop-opacity=".26"/>
+            <stop offset="60%" stop-color="${card}" stop-opacity=".14"/>
+            <stop offset="100%" stop-color="${card}" stop-opacity="0"/>
+          </radialGradient>
+
+          <radialGradient id="hva-v2-orb" cx="36%" cy="32%" r="74%">
+            <stop offset="0%" stop-color="#ffffff" stop-opacity=".24"/>
+            <stop offset="14%" stop-color="${haloColor}" stop-opacity=".28"/>
+            <stop offset="48%" stop-color="${card}" stop-opacity=".24"/>
+            <stop offset="100%" stop-color="${card}" stop-opacity=".10"/>
+          </radialGradient>
+
+          <linearGradient id="hva-v2-ring" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="${accent}"/>
+            <stop offset="50%" stop-color="${stateColor}"/>
+            <stop offset="100%" stop-color="${primary}"/>
+          </linearGradient>
+
+          <filter id="hva-v2-glow" x="-120%" y="-120%" width="340%" height="340%">
+            <feGaussianBlur stdDeviation="8" result="blur"/>
+            <feColorMatrix
+              in="blur"
+              type="matrix"
+              values="1 0 0 0 0
+                      0 1 0 0 0
+                      0 0 1 0 0
+                      0 0 0 1 0"
+            />
+          </filter>
+
+          <filter id="hva-v2-soft-shadow" x="-80%" y="-80%" width="260%" height="260%">
+            <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000000" flood-opacity=".22"/>
+          </filter>
+        </defs>
+
+        <g filter="url(#hva-v2-glow)">
+          <circle cx="50" cy="50" r="38" fill="${haloColor}" opacity="${active ? '.16' : '.10'}">
+            <animate
+              attributeName="r"
+              values="${active ? '35;42;37;44;35' : '36;39;36'}"
+              dur="${pulseDuration}"
+              repeatCount="indefinite"
+            />
+            <animate
+              attributeName="opacity"
+              values="${active ? '.14;.28;.16;.30;.14' : '.08;.15;.08'}"
+              dur="${pulseDuration}"
+              repeatCount="indefinite"
+            />
+          </circle>
+          <circle cx="50" cy="50" r="26" fill="${haloColor}" opacity="${active ? '.12' : '.06'}">
+            <animate
+              attributeName="r"
+              values="${active ? '24;30;25;31;24' : '25;27;25'}"
+              dur="${pulseDuration}"
+              repeatCount="indefinite"
+            />
+          </circle>
+        </g>
+
+        <g filter="url(#hva-v2-soft-shadow)">
+          <circle cx="50" cy="50" r="31" fill="url(#hva-v2-orb)"/>
+          <circle cx="50" cy="50" r="24.5" fill="url(#hva-v2-core)"/>
+
+          <ellipse
+            cx="40"
+            cy="35"
+            rx="15"
+            ry="8"
+            fill="#ffffff"
+            opacity=".13"
+            transform="rotate(-18 40 35)"
+          />
+
+          <circle
+            cx="50"
+            cy="50"
+            r="29"
+            fill="none"
+            stroke="url(#hva-v2-ring)"
+            stroke-width="2.2"
+            stroke-opacity="${error ? '.95' : '.84'}"
+          >
+            <animate
+              attributeName="r"
+              values="${active ? '28;30.5;29;31;28' : '28.5;29.5;28.5'}"
+              dur="${pulseDuration}"
+              repeatCount="indefinite"
+            />
+            <animate
+              attributeName="stroke-opacity"
+              values="${active ? '.82;1;.80;1;.82' : '.64;.82;.64'}"
+              dur="${pulseDuration}"
+              repeatCount="indefinite"
+            />
+          </circle>
+
+          <circle
+            cx="50"
+            cy="50"
+            r="20"
+            fill="none"
+            stroke="#ffffff"
+            stroke-opacity=".08"
+            stroke-width="1"
+          />
+
+          <g>
+            ${stateVisual}
+          </g>
+        </g>
 
         ${
-          active
+          connecting
             ? `
-              <ellipse
-                cx="40"
-                cy="42"
-                rx="19"
-                ry="14"
-                fill="#5feaff"
-                opacity=".34"
+              <circle
+                cx="50"
+                cy="50"
+                r="39"
+                fill="none"
+                stroke="${primary}"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-dasharray="18 226"
+                opacity=".7"
               >
-                <animate
-                  attributeName="cx"
-                  values="38;54;45;38"
-                  dur="${speed}"
+                <animateTransform
+                  attributeName="transform"
+                  type="rotate"
+                  from="0 50 50"
+                  to="360 50 50"
+                  dur=".95s"
                   repeatCount="indefinite"
                 />
-
-                <animate
-                  attributeName="ry"
-                  values="12;19;14;12"
-                  dur="${speed}"
-                  repeatCount="indefinite"
-                />
-              </ellipse>
-
-              <ellipse
-                cx="60"
-                cy="60"
-                rx="18"
-                ry="15"
-                fill="#fa68c0"
-                opacity=".30"
-              >
-                <animate
-                  attributeName="cx"
-                  values="62;47;57;62"
-                  dur="${speed}"
-                  repeatCount="indefinite"
-                />
-
-                <animate
-                  attributeName="rx"
-                  values="15;22;18;15"
-                  dur="${speed}"
-                  repeatCount="indefinite"
-                />
-              </ellipse>
-
-              <ellipse
-                cx="52"
-                cy="39"
-                rx="15"
-                ry="11"
-                fill="#816cff"
-                opacity=".22"
-              >
-                <animate
-                  attributeName="cy"
-                  values="36;51;40;36"
-                  dur="${speed}"
-                  repeatCount="indefinite"
-                />
-              </ellipse>
+              </circle>
             `
             : ''
         }
-
-        <!-- luminous outer edge -->
-
-        <circle
-          cx="50"
-          cy="50"
-          r="33"
-          fill="none"
-          stroke="url(#hva-ring)"
-          stroke-width="${speaking ? '3.5' : '2.3'}"
-          opacity=".88"
-        >
-          <animate
-            attributeName="r"
-            values="${active ? '31;35;32;34;31' : '32;33;32'}"
-            dur="${speed}"
-            repeatCount="indefinite"
-          />
-
-          <animate
-            attributeName="opacity"
-            values=".92;.48;.82;.60;.92"
-            dur="${speed}"
-            repeatCount="indefinite"
-          />
-        </circle>
-
-      </g>
-
-      ${
-        connecting
-          ? `
-            <circle
-              cx="50"
-              cy="50"
-              r="42"
-              fill="none"
-              stroke="url(#hva-ring)"
-              stroke-width="3"
-              stroke-linecap="round"
-              stroke-dasharray="27 240"
-            >
-              <animateTransform
-                attributeName="transform"
-                type="rotate"
-                from="0 50 50"
-                to="360 50 50"
-                dur=".8s"
-                repeatCount="indefinite"
-              />
-            </circle>
-          `
-          : ''
-      }
-
-      ${
-        error
-          ? `
-            <circle
-              cx="50"
-              cy="50"
-              r="35"
-              fill="#ff4f67"
-              opacity=".15"
-            >
-              <animate
-                attributeName="opacity"
-                values=".08;.34;.08"
-                dur=".9s"
-                repeatCount="indefinite"
-              />
-            </circle>
-          `
-          : ''
-      }
-    </svg>
-  `
+      </svg>
+    `
   }
 
   private async setupBoostedAudio(audioElement: HTMLAudioElement): Promise<void> {
@@ -783,18 +796,24 @@ export class HomeVoiceAgentController {
     const source = audioContext.createMediaStreamSource(srcObject)
     const gain = audioContext.createGain()
     const compressor = audioContext.createDynamicsCompressor()
+    const outputGain = audioContext.createGain()
 
-    gain.gain.value = 10
+    // Raise quiet speech before compression, then restore output loudness after
+    // peak control. This produces more perceived volume without simply clipping.
+    gain.gain.value = 4
 
-    compressor.threshold.value = 0
-    compressor.knee.value = 0
-    compressor.ratio.value = 10
-    compressor.attack.value = 0.001
-    compressor.release.value = 0.1
+    compressor.threshold.value = -18
+    compressor.knee.value = 12
+    compressor.ratio.value = 4
+    compressor.attack.value = 0.003
+    compressor.release.value = 0.2
+
+    outputGain.gain.value = 3
 
     source.connect(gain)
     gain.connect(compressor)
-    compressor.connect(audioContext.destination)
+    compressor.connect(outputGain)
+    outputGain.connect(audioContext.destination)
 
     audioElement.muted = true
 
@@ -804,5 +823,6 @@ export class HomeVoiceAgentController {
     this.audioSource = source
     this.audioGain = gain
     this.audioCompressor = compressor
+    this.audioOutputGain = outputGain
   }
 }
