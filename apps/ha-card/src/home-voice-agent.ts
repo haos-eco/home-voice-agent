@@ -5,8 +5,6 @@ import {
   type OpenAIRealtimeModels,
 } from '@openai/agents/realtime'
 
-import { WakeWordStream, type WakeDetection } from './wake-word-stream.js'
-
 export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
 
 type HassLike = {
@@ -109,55 +107,11 @@ export class HomeVoiceAgentController {
   private audioGain: GainNode | null = null
   private audioCompressor: DynamicsCompressorNode | null = null
 
-  private readonly wakeWord: WakeWordStream
-  private wakeWordResumeTimer: number | null = null
-  private wakeWordBootstrapTimer: number | null = null
-  private wakeWordEnabled = false
-
-  public constructor() {
-    this.wakeWord = new WakeWordStream(async (detection: WakeDetection) => {
-      console.info('[Home Voice Agent] Activated by wake word:', detection.keyword, detection.score)
-      await this.start()
-    })
-  }
-
-  public async enableWakeWord(): Promise<void> {
-    this.wakeWordEnabled = true
-
-    if (!this.config.room || !this.config.deviceId) {
-      throw new Error('Voice agent room/device configuration is missing.')
-    }
-
-    if (this.session || this.currentState !== 'idle') {
-      return
-    }
-
-    try {
-      await this.wakeWord.start({
-        room: this.config.room,
-        deviceId: this.config.deviceId,
-      })
-    } catch (error) {
-      console.error('[Home Voice Agent] Could not start wake listener', error)
-      throw error
-    }
-  }
-
-  public async disableWakeWord(): Promise<void> {
-    this.wakeWordEnabled = false
-
-    this.clearWakeWordResumeTimer()
-
-    await this.wakeWord.stop()
-  }
-
   public configure(partialConfig: Partial<VoiceAgentConfig>): void {
     this.config = {
       ...this.config,
       ...partialConfig,
     }
-
-    this.scheduleWakeWordBootstrap()
   }
 
   public bindHass(hass: HassLike): void {
@@ -167,8 +121,6 @@ export class HomeVoiceAgentController {
       this.hassInitiallyBound = true
       void this.publishState()
     }
-
-    this.scheduleWakeWordBootstrap()
   }
 
   public get state(): VoiceAgentState {
@@ -190,9 +142,6 @@ export class HomeVoiceAgentController {
     if (this.session || this.currentState === 'connecting') {
       return
     }
-
-    this.clearWakeWordResumeTimer()
-    await this.wakeWord.stop()
 
     this.clearErrorTimer()
     this.setState('connecting')
@@ -253,7 +202,6 @@ export class HomeVoiceAgentController {
         if (connectionState === 'disconnected' && !this.stopping && this.session === session) {
           this.releaseSession()
           this.setState('idle')
-          this.resumeWakeWord()
         }
       })
 
@@ -309,7 +257,6 @@ export class HomeVoiceAgentController {
 
     this.setState('idle')
     this.stopping = false
-    this.resumeWakeWord()
   }
 
   public interrupt(): void {
@@ -334,9 +281,6 @@ export class HomeVoiceAgentController {
       room: this.config.room,
       deviceId: this.config.deviceId,
       stateEntity: this.config.stateEntity,
-      wakeWordEnabled: this.wakeWordEnabled,
-      wakeWordActive: this.wakeWord.isActive,
-      wakeWordBootstrapScheduled: this.wakeWordBootstrapTimer !== null,
     }
   }
 
@@ -443,7 +387,6 @@ export class HomeVoiceAgentController {
 
       if (this.currentState === 'error') {
         this.setState('idle')
-        this.resumeWakeWord()
       }
     }, 8_000)
   }
@@ -786,82 +729,6 @@ export class HomeVoiceAgentController {
       }
     </svg>
   `
-  }
-
-  private scheduleWakeWordBootstrap(): void {
-    if (!this.hass) return
-
-    if (!this.config.room || !this.config.deviceId) return
-
-    if (this.session || this.currentState !== 'idle' || this.wakeWord.isActive) {
-      return
-    }
-
-    if (this.wakeWordBootstrapTimer !== null) return
-
-    console.info('[Home Voice Agent] Scheduling wake listener startup', {
-      room: this.config.room,
-      deviceId: this.config.deviceId,
-    })
-
-    this.wakeWordBootstrapTimer = window.setTimeout(() => {
-      this.wakeWordBootstrapTimer = null
-
-      if (
-        !this.hass ||
-        !this.config.room ||
-        !this.config.deviceId ||
-        this.session ||
-        this.currentState !== 'idle' ||
-        this.wakeWord.isActive
-      ) {
-        return
-      }
-
-      console.info('[Home Voice Agent] Starting wake listener', {
-        room: this.config.room,
-        deviceId: this.config.deviceId,
-      })
-
-      void this.enableWakeWord().catch(error => {
-        console.error('[Home Voice Agent] Automatic wake startup failed', error)
-
-        window.setTimeout(() => {
-          this.scheduleWakeWordBootstrap()
-        }, 2_000)
-      })
-    }, 1_500)
-  }
-
-  private clearWakeWordResumeTimer(): void {
-    if (this.wakeWordResumeTimer === null) return
-    window.clearTimeout(this.wakeWordResumeTimer)
-    this.wakeWordResumeTimer = null
-  }
-
-  private resumeWakeWord(): void {
-    this.clearWakeWordResumeTimer()
-
-    if (!this.wakeWordEnabled || this.session || this.currentState !== 'idle') {
-      return
-    }
-
-    this.wakeWordResumeTimer = window.setTimeout(() => {
-      this.wakeWordResumeTimer = null
-
-      if (!this.wakeWordEnabled || this.session || this.currentState !== 'idle') {
-        return
-      }
-
-      void this.wakeWord
-        .start({
-          room: this.config.room,
-          deviceId: this.config.deviceId,
-        })
-        .catch(error => {
-          console.error('[Home Voice Agent] ' + 'Could not resume wake listener', error)
-        })
-    }, 500)
   }
 
   private async setupBoostedAudio(audioElement: HTMLAudioElement): Promise<void> {
