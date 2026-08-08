@@ -888,13 +888,13 @@ export class HomeVoiceAgentController {
     const gain = audioContext.createGain()
     const compressor = audioContext.createDynamicsCompressor()
 
-    gain.gain.value = 6
+    gain.gain.value = 10
 
-    compressor.threshold.value = -10
-    compressor.knee.value = 12
-    compressor.ratio.value = 8
-    compressor.attack.value = 0.003
-    compressor.release.value = 0.2
+    compressor.threshold.value = 0
+    compressor.knee.value = 0
+    compressor.ratio.value = 10
+    compressor.attack.value = 0.001
+    compressor.release.value = 0.1
 
     source.connect(gain)
     gain.connect(compressor)
