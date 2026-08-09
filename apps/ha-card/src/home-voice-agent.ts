@@ -341,6 +341,7 @@ type VoiceAgentConfig = {
   sensitiveEntityIds: string[]
   sensitiveDeviceIds: string[]
   nonSensitiveEntityIds: string[]
+  stopPhrases: string[]
 }
 
 type RealtimeTokenResponse = {
@@ -359,6 +360,14 @@ const DEFAULT_CONFIG: VoiceAgentConfig = {
   sensitiveEntityIds: [],
   sensitiveDeviceIds: [],
   nonSensitiveEntityIds: [],
+  stopPhrases: [
+    'ok ciao',
+    'okay ciao',
+    'ok ciao dona',
+    'okay ciao dona',
+    'ok ciao grazie',
+    'okay ciao grazie',
+  ],
 }
 
 const HOME_KNOWLEDGE_REFRESH_MS = 60_000
@@ -868,6 +877,9 @@ export class HomeVoiceAgentController {
       nonSensitiveEntityIds: partialConfig.nonSensitiveEntityIds
         ? [...new Set(partialConfig.nonSensitiveEntityIds.filter(Boolean))]
         : this.config.nonSensitiveEntityIds,
+      stopPhrases: partialConfig.stopPhrases
+        ? [...new Set(partialConfig.stopPhrases.map(value => value.trim()).filter(Boolean))]
+        : this.config.stopPhrases,
     }
 
     for (const entity of this.homeCatalogCache) {
@@ -1117,11 +1129,25 @@ export class HomeVoiceAgentController {
       const transcript = payload.transcript.trim()
       if (!transcript) return
 
+      const normalized = this.normalizeConfirmationSpeech(transcript)
+
+      const shouldStop = this.config.stopPhrases.some(
+        phrase => this.normalizeConfirmationSpeech(phrase) === normalized,
+      )
+
+      if (shouldStop) {
+        console.info('[Home Voice Agent] Session stop phrase detected', {
+          transcript,
+        })
+        this.stop()
+        return
+      }
+
       this.userSpeechTranscripts.set(sequence, {
         sequence,
         itemId: payload.item_id,
         transcript,
-        normalized: this.normalizeConfirmationSpeech(transcript),
+        normalized,
         receivedAt: Date.now(),
       })
       this.pruneUserSpeechTracking()
