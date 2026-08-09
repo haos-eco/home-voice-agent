@@ -113,46 +113,6 @@ type LearnedAliasEvidenceKind =
   | 'explicit_learning'
   | 'explicit_correction'
 
-type LearnedAliasEvidence =
-  | {
-      id: string
-      kind: LearnedAliasEvidenceKind
-      at: number
-    }
-  | {
-      id: string
-      kind: 'contradiction'
-      at: number
-      severity: 'normal' | 'explicit_correction'
-    }
-  | {
-      id: string
-      kind: 'legacy_snapshot'
-      at: number
-      confidence: number
-      observations: number
-      successful_uses: number
-      contradictions: number
-      last_used_at: number | null
-    }
-
-type LearnedPreferenceEvidence =
-  | {
-      id: string
-      kind: 'implicit' | 'explicit' | 'correction'
-      at: number
-      value: number
-    }
-  | {
-      id: string
-      kind: 'legacy_snapshot'
-      at: number
-      value: number
-      confidence: number
-      observations: number
-      last_used_at: number | null
-    }
-
 type LearnedEntityAlias = {
   id: string
   phrase: string
@@ -167,7 +127,6 @@ type LearnedEntityAlias = {
   created_at: number
   updated_at: number
   last_used_at: number | null
-  evidence: LearnedAliasEvidence[]
 }
 
 type LearnedNumericPreference = {
@@ -181,15 +140,45 @@ type LearnedNumericPreference = {
   created_at: number
   updated_at: number
   last_used_at: number | null
-  evidence: LearnedPreferenceEvidence[]
+}
+
+type HomeLearningThresholds = {
+  direct_alias_confidence: number
+  preference_context_confidence: number
+  alias_boost_confidence: number
 }
 
 type HomeLearningStore = {
-  version: 2
+  version: 1
+  revision: number
+  thresholds: HomeLearningThresholds
   aliases: LearnedEntityAlias[]
   preferences: LearnedNumericPreference[]
-  tombstones: Record<string, number>
   updated_at: number
+}
+
+type HomeMemoryAliasObservationResponse = {
+  ok?: boolean
+  duplicate?: boolean
+  event_id?: string
+  revision?: number
+  alias?: LearnedEntityAlias | null
+}
+
+type HomeMemoryPreferenceObservationResponse = {
+  ok?: boolean
+  duplicate?: boolean
+  event_id?: string
+  revision?: number
+  preference?: LearnedNumericPreference | null
+}
+
+type HomeMemoryReconcileResponse = {
+  ok?: boolean
+  revision?: number
+  entity_count?: number
+  removed_aliases?: number
+  removed_preferences?: number
 }
 
 type UserSpeechTranscript = {
@@ -198,10 +187,6 @@ type UserSpeechTranscript = {
   transcript: string
   normalized: string
   receivedAt: number
-}
-
-type FrontendUserDataResponse = {
-  value?: unknown
 }
 
 type RecentDiscoveryHint = {
@@ -317,23 +302,18 @@ const DEFAULT_CONFIG: VoiceAgentConfig = {
 
 const HOME_KNOWLEDGE_REFRESH_MS = 60_000
 const HOME_KNOWLEDGE_DEBOUNCE_MS = 750
+const HOME_AREAS_CACHE_MS = 5 * 60_000
 
-const HOME_LEARNING_STORAGE_KEY = 'home_voice_agent_learning_v2'
-const HOME_LEARNING_LEGACY_STORAGE_KEY = 'home_voice_agent_learning_v1'
-const HOME_LEARNING_LOCAL_STORAGE_KEY = 'home_voice_agent_learning_v2_fallback'
-const HOME_LEARNING_LEGACY_LOCAL_STORAGE_KEY = 'home_voice_agent_learning_v1_fallback'
 const HOME_LEARNING_REFRESH_MS = 15_000
-const HOME_LEARNING_SAVE_DEBOUNCE_MS = 600
 const HOME_LEARNING_DISCOVERY_HINT_MS = 60_000
-const HOME_LEARNING_MAX_ALIASES = 250
-const HOME_LEARNING_MAX_PREFERENCES = 120
-const HOME_LEARNING_MAX_TOMBSTONES = 4_000
-const HOME_LEARNING_DIRECT_CONFIDENCE = 0.82
-const HOME_LEARNING_PREFERENCE_CONTEXT_CONFIDENCE = 0.76
-const HOME_LEARNING_BOOST_CONFIDENCE = 0.48
-const HOME_LEARNING_STALE_REFRESH_LIMIT = 3
 const HOME_LEARNING_AGENT_UPDATE_DEBOUNCE_MS = 250
 const HOME_SENSITIVE_TRANSCRIPT_WAIT_MS = 2_500
+
+const DEFAULT_HOME_LEARNING_THRESHOLDS: HomeLearningThresholds = {
+  direct_alias_confidence: 0.82,
+  preference_context_confidence: 0.76,
+  alias_boost_confidence: 0.48,
+}
 
 const HOME_CONTROL_PARAMETERS = {
   type: 'object',
@@ -698,22 +678,23 @@ export class HomeVoiceAgentController {
   private homeKnowledgeUnsubscribers: Array<() => Promise<void>> = []
 
   private homeLearningStore: HomeLearningStore = {
-    version: 2,
+    version: 1,
+    revision: 0,
+    thresholds: { ...DEFAULT_HOME_LEARNING_THRESHOLDS },
     aliases: [],
     preferences: [],
-    tombstones: {},
     updated_at: 0,
   }
   private homeLearningLoaded = false
   private homeLearningLastRefresh = 0
-  private homeLearningSaveTimer: number | null = null
-  private homeLearningPersistPromise: Promise<void> | null = null
-  private homeLearningPersistRequested = false
+  private homeLearningRefreshPromise: Promise<void> | null = null
   private homeLearningAgentUpdateTimer: number | null = null
-  private homeLearningMissingCatalogCounts = new Map<string, number>()
   private learningEventCounter = 0
-  private homeLearningStorageMode: 'home_assistant' | 'local_fallback' | 'unknown' = 'unknown'
   private recentDiscoveryHints = new Map<string, RecentDiscoveryHint>()
+
+  private homeAreasCache: HomeAreaEntry[] = []
+  private homeAreasLastRefresh = 0
+  private homeAreasRefreshPromise: Promise<HomeAreaEntry[]> | null = null
 
   private audioContext: AudioContext | null = null
   private audioSource: MediaStreamAudioSourceNode | null = null
@@ -750,6 +731,9 @@ export class HomeVoiceAgentController {
     if (!this.hassInitiallyBound) {
       this.hassInitiallyBound = true
       void this.publishState()
+      void this.getHomeAreas().catch(error => {
+        console.warn('[Home Voice Agent] Could not preload Home Assistant areas', error)
+      })
       void this.refreshHomeKnowledge('initial bind')
       void this.refreshHomeLearningMemory(true)
       this.startHomeKnowledgeRefreshTimer()
@@ -776,6 +760,7 @@ export class HomeVoiceAgentController {
   }
 
   public async start(options: VoiceAgentStartOptions = {}): Promise<void> {
+    const startupStartedAt = performance.now()
     this.lastError = null
     this.pendingSensitiveAction = null
     this.userSpeechSequence = 0
@@ -790,24 +775,37 @@ export class HomeVoiceAgentController {
     this.setState('connecting')
 
     try {
-      if (!options.inputReady && this.prepareInputHook) {
-        await this.prepareInputHook()
-      }
+      // Start independent prerequisites together. The old path awaited microphone
+      // preparation, memory, token creation and area lookup sequentially, which made
+      // wake-word activation noticeably slower as features accumulated.
+      const inputPreparation =
+        !options.inputReady && this.prepareInputHook ? this.prepareInputHook() : Promise.resolve()
+      const memoryPreparation = this.refreshHomeLearningMemory(false)
+      const credentialPreparation = this.requestClientCredential()
+      const homeAreasPreparation = this.getHomeAreas().catch(error => {
+        console.warn('[Home Voice Agent] Could not load Home Assistant areas', error)
+        return [] as HomeAreaEntry[]
+      })
 
-      await this.refreshHomeLearningMemory(false)
+      const [credential, homeAreas] = await Promise.all([
+        credentialPreparation,
+        homeAreasPreparation,
+        inputPreparation,
+        memoryPreparation,
+      ])
 
-      const credential = await this.requestClientCredential()
+      console.debug('[Home Voice Agent] Startup prerequisites ready', {
+        elapsedMs: Math.round(performance.now() - startupStartedAt),
+        memoryLoaded: this.homeLearningLoaded,
+        memoryRevision: this.homeLearningStore.revision,
+        cachedAreas: this.homeAreasCache.length,
+      })
 
       const audioElement = document.createElement('audio')
       audioElement.autoplay = true
 
       const transport = new OpenAIRealtimeWebRTC({
         audioElement,
-      })
-
-      const homeAreas = await this.getHomeAreas().catch(error => {
-        console.warn('[Home Voice Agent] Could not load Home Assistant areas', error)
-        return [] as HomeAreaEntry[]
       })
 
       const agentInstructions = this.buildAgentInstructions(homeAreas)
@@ -856,6 +854,9 @@ export class HomeVoiceAgentController {
 
       session.transport.on('connection_change', connectionState => {
         if (connectionState === 'connected') {
+          console.debug('[Home Voice Agent] Realtime connected', {
+            activationMs: Math.round(performance.now() - startupStartedAt),
+          })
           void this.setupBoostedAudio(audioElement)
           this.setState('listening')
           this.resetInactivityTimer()
@@ -1080,11 +1081,12 @@ export class HomeVoiceAgentController {
       homeKnowledgeSubscriptions: this.homeKnowledgeUnsubscribers.length,
       learnedAliases: this.homeLearningStore.aliases.length,
       learnedHighConfidenceAliases: this.homeLearningStore.aliases.filter(
-        alias => alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE,
+        alias => alias.confidence >= this.homeLearningDirectConfidence,
       ).length,
       learnedPreferences: this.homeLearningStore.preferences.length,
       learningStoreVersion: this.homeLearningStore.version,
-      learningStorage: this.homeLearningStorageMode,
+      learningRevision: this.homeLearningStore.revision,
+      learningStorage: 'backend_sqlite',
       sensitiveEntityOverrides: this.config.sensitiveEntityIds.length,
       sensitiveDeviceOverrides: this.config.sensitiveDeviceIds.length,
       learningLastRefresh: this.homeLearningLastRefresh || null,
@@ -1110,7 +1112,7 @@ ${learnedContext}`
 
   private buildLearnedContextSummary(): string {
     const aliases = this.homeLearningStore.aliases
-      .filter(alias => alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE)
+      .filter(alias => alias.confidence >= this.homeLearningDirectConfidence)
       .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
       .slice(0, 24)
       .map(alias => {
@@ -1119,7 +1121,7 @@ ${learnedContext}`
       })
 
     const preferences = this.homeLearningStore.preferences
-      .filter(preference => preference.confidence >= HOME_LEARNING_PREFERENCE_CONTEXT_CONFIDENCE)
+      .filter(preference => preference.confidence >= this.homeLearningPreferenceContextConfidence)
       .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
       .slice(0, 16)
       .map(preference => {
@@ -1311,13 +1313,20 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
         const catalog = await this.getHomeCatalog()
         const target = catalog.find(({ entity_id }) => entity_id === entity)
 
-        await this.observeLearnedAlias({
+        const stored = await this.observeLearnedAlias({
           phrase: args.phrase,
           areaName: args.area || target?.area_name || areaName,
           domain: args.domain || target?.domain || null,
           entityId: entity,
           evidence: args.correction ? 'explicit_correction' : 'explicit_learning',
         })
+
+        if (!stored) {
+          return JSON.stringify({
+            ok: false,
+            error: 'Could not persist the learned alias.',
+          })
+        }
 
         return JSON.stringify({
           ok: true,
@@ -1361,13 +1370,20 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       const catalog = await this.getHomeCatalog()
       const target = catalog.find(({ entity_id }) => entity_id === entity)
 
-      await this.observeNumericPreference({
+      const stored = await this.observeNumericPreference({
         metric: args.metric,
         value: sanitizedPreferenceValue,
         areaName: args.area || target?.area_name || areaName,
         entityId: entity,
         evidence: args.correction ? 'correction' : 'explicit',
       })
+
+      if (!stored) {
+        return JSON.stringify({
+          ok: false,
+          error: 'Could not persist the numeric preference.',
+        })
+      }
 
       return JSON.stringify({
         ok: true,
@@ -1570,7 +1586,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       if (
         alias.entity_id !== entity.entity_id ||
         alias.normalized_phrase !== query ||
-        alias.confidence < HOME_LEARNING_BOOST_CONFIDENCE
+        alias.confidence < this.homeLearningAliasBoostConfidence
       ) {
         continue
       }
@@ -1588,7 +1604,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       }
 
       const boost =
-        alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE
+        alias.confidence >= this.homeLearningDirectConfidence
           ? 250 * alias.confidence
           : 130 * alias.confidence
 
@@ -1600,12 +1616,25 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
 
   private emptyLearningStore(): HomeLearningStore {
     return {
-      version: 2,
+      version: 1,
+      revision: 0,
+      thresholds: { ...DEFAULT_HOME_LEARNING_THRESHOLDS },
       aliases: [],
       preferences: [],
-      tombstones: {},
       updated_at: 0,
     }
+  }
+
+  private get homeLearningDirectConfidence(): number {
+    return this.homeLearningStore.thresholds.direct_alias_confidence
+  }
+
+  private get homeLearningPreferenceContextConfidence(): number {
+    return this.homeLearningStore.thresholds.preference_context_confidence
+  }
+
+  private get homeLearningAliasBoostConfidence(): number {
+    return this.homeLearningStore.thresholds.alias_boost_confidence
   }
 
   private safeFiniteNumber(value: unknown, fallback: number): number {
@@ -1613,8 +1642,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
   }
 
   private safeNonNegativeInteger(value: unknown, fallback = 0): number {
-    const numeric = this.safeFiniteNumber(value, fallback)
-    return Math.max(0, Math.trunc(numeric))
+    return Math.max(0, Math.trunc(this.safeFiniteNumber(value, fallback)))
   }
 
   private safeTimestamp(value: unknown, fallback: number): number {
@@ -1644,12 +1672,10 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       return value >= 0 && value <= 100 ? value : null
     }
 
-    // Home Assistant climate targets vary by installation. These bounds are
-    // deliberately broad enough for real HVAC use while rejecting corrupt data.
     return value >= 5 && value <= 40 ? value : null
   }
 
-  private createLearningEvidenceId(prefix: string): string {
+  private createLearningEventId(prefix: string): string {
     this.learningEventCounter = (this.learningEventCounter + 1) % Number.MAX_SAFE_INTEGER
 
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -1661,856 +1687,217 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       .slice(2)}`
   }
 
-  private sanitizeAliasEvidence(
-    value: unknown,
-    fallbackId: string,
-    fallbackUpdatedAt: number,
-    legacySource?: Partial<LearnedEntityAlias>,
-  ): LearnedAliasEvidence[] {
-    const result: LearnedAliasEvidence[] = []
+  private sanitizeLearnedAlias(value: unknown): LearnedEntityAlias | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const item = value as Record<string, unknown>
 
-    if (Array.isArray(value)) {
-      for (const raw of value) {
-        if (!raw || typeof raw !== 'object') continue
-        const item = raw as Record<string, unknown>
-        const id = typeof item.id === 'string' && item.id ? item.id : ''
-        const at = this.safeTimestamp(item.at, fallbackUpdatedAt)
-        const kind = item.kind
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const phrase = typeof item.phrase === 'string' ? item.phrase.trim() : ''
+    const entityId = typeof item.entity_id === 'string' ? item.entity_id.trim() : ''
+    if (!id || !phrase || !entityId) return null
 
-        if (
-          id &&
-          (kind === 'discovery' ||
-            kind === 'successful_status' ||
-            kind === 'successful_action' ||
-            kind === 'explicit_learning' ||
-            kind === 'explicit_correction')
-        ) {
-          result.push({ id, kind, at })
-          continue
-        }
-
-        if (id && kind === 'contradiction') {
-          result.push({
-            id,
-            kind,
-            at,
-            severity: item.severity === 'explicit_correction' ? 'explicit_correction' : 'normal',
-          })
-          continue
-        }
-
-        if (id && kind === 'legacy_snapshot') {
-          result.push({
-            id,
-            kind,
-            at,
-            confidence: this.clampConfidence(this.safeFiniteNumber(item.confidence, 0)),
-            observations: this.safeNonNegativeInteger(item.observations),
-            successful_uses: this.safeNonNegativeInteger(item.successful_uses),
-            contradictions: this.safeNonNegativeInteger(item.contradictions),
-            last_used_at:
-              item.last_used_at === null || item.last_used_at === undefined
-                ? null
-                : this.safeTimestamp(item.last_used_at, at),
-          })
-        }
-      }
-    }
-
-    if (result.length === 0 && legacySource) {
-      result.push({
-        id: `legacy-alias:${fallbackId}:${fallbackUpdatedAt}`,
-        kind: 'legacy_snapshot',
-        at: fallbackUpdatedAt,
-        confidence: this.clampConfidence(this.safeFiniteNumber(legacySource.confidence, 0)),
-        observations: this.safeNonNegativeInteger(legacySource.observations),
-        successful_uses: this.safeNonNegativeInteger(legacySource.successful_uses),
-        contradictions: this.safeNonNegativeInteger(legacySource.contradictions),
-        last_used_at:
-          legacySource.last_used_at === null || legacySource.last_used_at === undefined
-            ? null
-            : this.safeTimestamp(legacySource.last_used_at, fallbackUpdatedAt),
-      })
-    }
-
-    return this.dedupeAliasEvidence(result)
-  }
-
-  private sanitizePreferenceEvidence(
-    value: unknown,
-    fallbackId: string,
-    metric: LearnedNumericPreference['metric'],
-    fallbackUpdatedAt: number,
-    legacySource?: Partial<LearnedNumericPreference>,
-  ): LearnedPreferenceEvidence[] {
-    const result: LearnedPreferenceEvidence[] = []
-
-    if (Array.isArray(value)) {
-      for (const raw of value) {
-        if (!raw || typeof raw !== 'object') continue
-        const item = raw as Record<string, unknown>
-        const id = typeof item.id === 'string' && item.id ? item.id : ''
-        const at = this.safeTimestamp(item.at, fallbackUpdatedAt)
-        const kind = item.kind
-        const numericValue = this.sanitizePreferenceValue(metric, item.value)
-
-        if (
-          id &&
-          numericValue !== null &&
-          (kind === 'implicit' || kind === 'explicit' || kind === 'correction')
-        ) {
-          result.push({ id, kind, at, value: numericValue })
-          continue
-        }
-
-        if (id && kind === 'legacy_snapshot' && numericValue !== null) {
-          result.push({
-            id,
-            kind,
-            at,
-            value: numericValue,
-            confidence: this.clampConfidence(this.safeFiniteNumber(item.confidence, 0)),
-            observations: this.safeNonNegativeInteger(item.observations),
-            last_used_at:
-              item.last_used_at === null || item.last_used_at === undefined
-                ? null
-                : this.safeTimestamp(item.last_used_at, at),
-          })
-        }
-      }
-    }
-
-    if (result.length === 0 && legacySource) {
-      const numericValue = this.sanitizePreferenceValue(metric, legacySource.value)
-
-      if (numericValue !== null) {
-        result.push({
-          id: `legacy-preference:${fallbackId}:${fallbackUpdatedAt}`,
-          kind: 'legacy_snapshot',
-          at: fallbackUpdatedAt,
-          value: numericValue,
-          confidence: this.clampConfidence(this.safeFiniteNumber(legacySource.confidence, 0)),
-          observations: this.safeNonNegativeInteger(legacySource.observations),
-          last_used_at:
-            legacySource.last_used_at === null || legacySource.last_used_at === undefined
-              ? null
-              : this.safeTimestamp(legacySource.last_used_at, fallbackUpdatedAt),
-        })
-      }
-    }
-
-    return this.dedupePreferenceEvidence(result)
-  }
-
-  private compareLearningEvidence(
-    left: { id: string; kind: string; at: number },
-    right: { id: string; kind: string; at: number },
-  ): number {
-    if (left.at !== right.at) return left.at - right.at
-
-    const leftLegacy = left.kind === 'legacy_snapshot'
-    const rightLegacy = right.kind === 'legacy_snapshot'
-    if (leftLegacy !== rightLegacy) return leftLegacy ? -1 : 1
-
-    return left.id.localeCompare(right.id)
-  }
-
-  private dedupeAliasEvidence(evidence: LearnedAliasEvidence[]): LearnedAliasEvidence[] {
-    const byId = new Map<string, LearnedAliasEvidence>()
-
-    for (const item of evidence) {
-      const current = byId.get(item.id)
-      if (!current || item.at >= current.at) byId.set(item.id, item)
-    }
-
-    return [...byId.values()].sort((a, b) => this.compareLearningEvidence(a, b))
-  }
-
-  private dedupePreferenceEvidence(
-    evidence: LearnedPreferenceEvidence[],
-  ): LearnedPreferenceEvidence[] {
-    const byId = new Map<string, LearnedPreferenceEvidence>()
-
-    for (const item of evidence) {
-      const current = byId.get(item.id)
-      if (!current || item.at >= current.at) byId.set(item.id, item)
-    }
-
-    return [...byId.values()].sort((a, b) => this.compareLearningEvidence(a, b))
-  }
-
-  private rebuildAliasFromEvidence(alias: LearnedEntityAlias): LearnedEntityAlias {
-    const evidence = this.dedupeAliasEvidence(alias.evidence)
-    let confidence = 0
-    let observations = 0
-    let successfulUses = 0
-    let contradictions = 0
-    let lastUsedAt: number | null = null
-    let initialized = false
-
-    for (const item of evidence) {
-      if (item.kind === 'legacy_snapshot') {
-        confidence = item.confidence
-        observations = Math.max(observations, item.observations)
-        successfulUses = Math.max(successfulUses, item.successful_uses)
-        contradictions = Math.max(contradictions, item.contradictions)
-        lastUsedAt = item.last_used_at ?? lastUsedAt
-        initialized = true
-        continue
-      }
-
-      if (item.kind === 'contradiction') {
-        contradictions += 1
-        confidence = this.clampConfidence(
-          confidence * (item.severity === 'explicit_correction' ? 0.25 : 0.55),
-        )
-        initialized = true
-        continue
-      }
-
-      observations += 1
-
-      if (!initialized) {
-        confidence =
-          item.kind === 'explicit_correction'
-            ? 0.92
-            : item.kind === 'explicit_learning'
-              ? 0.84
-              : item.kind === 'successful_action'
-                ? 0.62
-                : item.kind === 'successful_status'
-                  ? 0.5
-                  : 0.34
-        initialized = true
-      } else if (item.kind === 'explicit_correction' || item.kind === 'explicit_learning') {
-        confidence = Math.max(
-          item.kind === 'explicit_correction' ? 0.92 : 0.84,
-          this.clampConfidence(confidence + (1 - confidence) * 0.3),
-        )
-      } else if (item.kind === 'successful_action') {
-        confidence = Math.max(0.62, this.clampConfidence(confidence + (1 - confidence) * 0.18))
-      } else if (item.kind === 'successful_status') {
-        confidence = Math.max(
-          0.5,
-          Math.min(0.78, this.clampConfidence(confidence + (1 - confidence) * 0.1)),
-        )
-      } else {
-        confidence = Math.max(
-          0.34,
-          Math.min(0.68, this.clampConfidence(confidence + (1 - confidence) * 0.06)),
-        )
-      }
-
-      if (
-        item.kind === 'successful_action' ||
-        item.kind === 'explicit_learning' ||
-        item.kind === 'explicit_correction'
-      ) {
-        successfulUses += 1
-        lastUsedAt = Math.max(lastUsedAt ?? 0, item.at)
-      } else if (item.kind === 'successful_status') {
-        lastUsedAt = Math.max(lastUsedAt ?? 0, item.at)
-      }
-    }
-
-    const firstAt = evidence[0]?.at ?? alias.created_at
-    const lastAt = evidence[evidence.length - 1]?.at ?? alias.updated_at
+    const normalizedPhrase =
+      typeof item.normalized_phrase === 'string' && item.normalized_phrase.trim()
+        ? item.normalized_phrase.trim()
+        : this.normalizeHomeName(phrase)
+    const createdAt = this.safeTimestamp(item.created_at, Date.now())
+    const updatedAt = this.safeTimestamp(item.updated_at, createdAt)
 
     return {
-      ...alias,
-      confidence: this.clampConfidence(confidence),
-      observations,
-      successful_uses: successfulUses,
-      contradictions,
-      created_at: Math.min(alias.created_at || firstAt, firstAt),
-      updated_at: Math.max(alias.updated_at || lastAt, lastAt),
-      last_used_at: lastUsedAt,
-      evidence,
+      id,
+      phrase,
+      normalized_phrase: normalizedPhrase,
+      area_name: this.safeNullableString(item.area_name),
+      domain: this.safeNullableString(item.domain),
+      entity_id: entityId,
+      confidence: Math.max(0, Math.min(0.99, this.safeFiniteNumber(item.confidence, 0))),
+      observations: this.safeNonNegativeInteger(item.observations),
+      successful_uses: this.safeNonNegativeInteger(item.successful_uses),
+      contradictions: this.safeNonNegativeInteger(item.contradictions),
+      created_at: createdAt,
+      updated_at: updatedAt,
+      last_used_at:
+        item.last_used_at === null || item.last_used_at === undefined
+          ? null
+          : this.safeTimestamp(item.last_used_at, updatedAt),
     }
   }
 
-  private rebuildPreferenceFromEvidence(
-    preference: LearnedNumericPreference,
-  ): LearnedNumericPreference {
-    const evidence = this.dedupePreferenceEvidence(preference.evidence)
-    let value = preference.value
-    let confidence = 0
-    let observations = 0
-    let lastUsedAt: number | null = null
-    let initialized = false
+  private sanitizeLearnedPreference(value: unknown): LearnedNumericPreference | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const item = value as Record<string, unknown>
+    if (!this.isLearningMetric(item.metric)) return null
 
-    for (const item of evidence) {
-      if (item.kind === 'legacy_snapshot') {
-        value = item.value
-        confidence = item.confidence
-        observations = Math.max(observations, item.observations)
-        lastUsedAt = item.last_used_at ?? lastUsedAt
-        initialized = true
-        continue
-      }
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const entityId = typeof item.entity_id === 'string' ? item.entity_id.trim() : ''
+    const numericValue = this.sanitizePreferenceValue(item.metric, item.value)
+    if (!id || !entityId || numericValue === null) return null
 
-      observations += 1
-      lastUsedAt = Math.max(lastUsedAt ?? 0, item.at)
-
-      if (!initialized) {
-        value = item.value
-        confidence = item.kind === 'correction' ? 0.88 : item.kind === 'explicit' ? 0.76 : 0.35
-        initialized = true
-        continue
-      }
-
-      if (item.kind === 'correction') {
-        value = item.value
-        confidence = 0.88
-        continue
-      }
-
-      const tolerance =
-        preference.metric === 'temperature'
-          ? 1.0
-          : preference.metric === 'brightness_pct'
-            ? 12
-            : 0.12
-      const distance = Math.abs(item.value - value)
-      const consistent = distance <= tolerance
-
-      if (consistent) {
-        value = value * 0.72 + item.value * 0.28
-        confidence = this.clampConfidence(confidence + (1 - confidence) * 0.16)
-      } else {
-        value = value * 0.45 + item.value * 0.55
-        confidence = this.clampConfidence(Math.max(0.24, confidence * 0.72))
-      }
-
-      if (item.kind === 'explicit') {
-        confidence = Math.max(confidence, 0.76)
-      }
-    }
-
-    const firstAt = evidence[0]?.at ?? preference.created_at
-    const lastAt = evidence[evidence.length - 1]?.at ?? preference.updated_at
+    const createdAt = this.safeTimestamp(item.created_at, Date.now())
+    const updatedAt = this.safeTimestamp(item.updated_at, createdAt)
 
     return {
-      ...preference,
-      value,
-      confidence: this.clampConfidence(confidence),
-      observations,
-      created_at: Math.min(preference.created_at || firstAt, firstAt),
-      updated_at: Math.max(preference.updated_at || lastAt, lastAt),
-      last_used_at: lastUsedAt,
-      evidence,
+      id,
+      metric: item.metric,
+      area_name: this.safeNullableString(item.area_name),
+      entity_id: entityId,
+      value: numericValue,
+      confidence: Math.max(0, Math.min(0.99, this.safeFiniteNumber(item.confidence, 0))),
+      observations: this.safeNonNegativeInteger(item.observations),
+      created_at: createdAt,
+      updated_at: updatedAt,
+      last_used_at:
+        item.last_used_at === null || item.last_used_at === undefined
+          ? null
+          : this.safeTimestamp(item.last_used_at, updatedAt),
     }
   }
 
-  private sanitizeLearningStore(value: unknown): HomeLearningStore {
-    if (!value || typeof value !== 'object') {
+  private sanitizeLearningContext(value: unknown): HomeLearningStore {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return this.emptyLearningStore()
     }
 
     const candidate = value as Record<string, unknown>
-    const now = Date.now()
-    const aliases: LearnedEntityAlias[] = []
-    const preferences: LearnedNumericPreference[] = []
-    const tombstones = this.sanitizeLearningTombstones(candidate.tombstones)
+    const rawThresholds =
+      candidate.thresholds && typeof candidate.thresholds === 'object'
+        ? (candidate.thresholds as Record<string, unknown>)
+        : {}
 
-    if (Array.isArray(candidate.aliases)) {
-      for (const raw of candidate.aliases) {
-        if (!raw || typeof raw !== 'object') continue
-        const item = raw as Partial<LearnedEntityAlias>
-        if (typeof item.phrase !== 'string' || typeof item.entity_id !== 'string') continue
+    const aliases = Array.isArray(candidate.aliases)
+      ? candidate.aliases
+          .map(value => this.sanitizeLearnedAlias(value))
+          .filter((value): value is LearnedEntityAlias => value !== null)
+      : []
+    const preferences = Array.isArray(candidate.preferences)
+      ? candidate.preferences
+          .map(value => this.sanitizeLearnedPreference(value))
+          .filter((value): value is LearnedNumericPreference => value !== null)
+      : []
 
-        const phrase = item.phrase.trim()
-        const normalizedPhrase = this.normalizeHomeName(phrase)
-        const entityId = item.entity_id.trim()
-        if (!normalizedPhrase || !entityId) continue
-
-        const areaName = this.safeNullableString(item.area_name)
-        const domain = this.safeNullableString(item.domain)
-        const id = this.learningAliasId(normalizedPhrase, areaName, domain, entityId)
-        const createdAt = this.safeTimestamp(item.created_at, now)
-        const updatedAt = this.safeTimestamp(item.updated_at, createdAt)
-        const evidence = this.sanitizeAliasEvidence(item.evidence, id, updatedAt, item)
-
-        aliases.push(
-          this.rebuildAliasFromEvidence({
-            id,
-            phrase,
-            normalized_phrase: normalizedPhrase,
-            area_name: areaName,
-            domain,
-            entity_id: entityId,
-            confidence: 0,
-            observations: 0,
-            successful_uses: 0,
-            contradictions: 0,
-            created_at: createdAt,
-            updated_at: updatedAt,
-            last_used_at: null,
-            evidence,
-          }),
-        )
-      }
-    }
-
-    if (Array.isArray(candidate.preferences)) {
-      for (const raw of candidate.preferences) {
-        if (!raw || typeof raw !== 'object') continue
-        const item = raw as Partial<LearnedNumericPreference>
-        if (!this.isLearningMetric(item.metric) || typeof item.entity_id !== 'string') continue
-
-        const entityId = item.entity_id.trim()
-        const numericValue = this.sanitizePreferenceValue(item.metric, item.value)
-        if (!entityId || numericValue === null) continue
-
-        const areaName = this.safeNullableString(item.area_name)
-        const id = this.learningPreferenceId(item.metric, areaName, entityId)
-        const createdAt = this.safeTimestamp(item.created_at, now)
-        const updatedAt = this.safeTimestamp(item.updated_at, createdAt)
-        const evidence = this.sanitizePreferenceEvidence(
-          item.evidence,
-          id,
-          item.metric,
-          updatedAt,
-          item,
-        )
-
-        preferences.push(
-          this.rebuildPreferenceFromEvidence({
-            id,
-            metric: item.metric,
-            area_name: areaName,
-            entity_id: entityId,
-            value: numericValue,
-            confidence: 0,
-            observations: 0,
-            created_at: createdAt,
-            updated_at: updatedAt,
-            last_used_at: null,
-            evidence,
-          }),
-        )
-      }
-    }
-
-    return this.mergeLearningStores(this.emptyLearningStore(), {
-      version: 2,
+    return {
+      version: 1,
+      revision: this.safeNonNegativeInteger(candidate.revision),
+      thresholds: {
+        direct_alias_confidence: Math.max(
+          0,
+          Math.min(
+            0.99,
+            this.safeFiniteNumber(
+              rawThresholds.direct_alias_confidence,
+              DEFAULT_HOME_LEARNING_THRESHOLDS.direct_alias_confidence,
+            ),
+          ),
+        ),
+        preference_context_confidence: Math.max(
+          0,
+          Math.min(
+            0.99,
+            this.safeFiniteNumber(
+              rawThresholds.preference_context_confidence,
+              DEFAULT_HOME_LEARNING_THRESHOLDS.preference_context_confidence,
+            ),
+          ),
+        ),
+        alias_boost_confidence: Math.max(
+          0,
+          Math.min(
+            0.99,
+            this.safeFiniteNumber(
+              rawThresholds.alias_boost_confidence,
+              DEFAULT_HOME_LEARNING_THRESHOLDS.alias_boost_confidence,
+            ),
+          ),
+        ),
+      },
       aliases,
       preferences,
-      tombstones,
-      updated_at: this.safeTimestamp(candidate.updated_at, 0),
-    })
+      updated_at: this.safeNonNegativeInteger(candidate.updated_at),
+    }
   }
 
-  private hasLearningStorePayload(value: unknown): boolean {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  private learningContextSignature(store = this.homeLearningStore): string {
+    const aliases = store.aliases
+      .map(alias => `${alias.id}:${alias.confidence}:${alias.updated_at}`)
+      .sort()
+      .join('|')
+    const preferences = store.preferences
+      .map(
+        preference =>
+          `${preference.id}:${preference.value}:${preference.confidence}:${preference.updated_at}`,
+      )
+      .sort()
+      .join('|')
 
-    const candidate = value as Record<string, unknown>
-    return (
-      candidate.version === 2 ||
-      Array.isArray(candidate.aliases) ||
-      Array.isArray(candidate.preferences) ||
-      (candidate.tombstones !== null &&
-        typeof candidate.tombstones === 'object' &&
-        !Array.isArray(candidate.tombstones))
+    return `${store.revision}::${aliases}::${preferences}`
+  }
+
+  private upsertLearnedAlias(alias: LearnedEntityAlias): void {
+    const index = this.homeLearningStore.aliases.findIndex(item => item.id === alias.id)
+    if (index >= 0) this.homeLearningStore.aliases[index] = alias
+    else this.homeLearningStore.aliases.push(alias)
+
+    this.homeLearningStore.updated_at = Math.max(
+      this.homeLearningStore.updated_at,
+      alias.updated_at,
     )
   }
 
-  private async loadRemoteLearningStoreWithLegacyMigration(): Promise<{
-    store: HomeLearningStore
-    migratedLegacy: boolean
-  }> {
-    if (!this.hass) {
-      return { store: this.emptyLearningStore(), migratedLegacy: false }
-    }
+  private upsertLearnedPreference(preference: LearnedNumericPreference): void {
+    const index = this.homeLearningStore.preferences.findIndex(item => item.id === preference.id)
+    if (index >= 0) this.homeLearningStore.preferences[index] = preference
+    else this.homeLearningStore.preferences.push(preference)
 
-    const currentResponse = await this.hass.callWS<FrontendUserDataResponse>({
-      type: 'frontend/get_user_data',
-      key: HOME_LEARNING_STORAGE_KEY,
-    })
-
-    if (this.hasLearningStorePayload(currentResponse?.value)) {
-      return { store: this.sanitizeLearningStore(currentResponse.value), migratedLegacy: false }
-    }
-
-    try {
-      const legacyResponse = await this.hass.callWS<FrontendUserDataResponse>({
-        type: 'frontend/get_user_data',
-        key: HOME_LEARNING_LEGACY_STORAGE_KEY,
-      })
-
-      if (this.hasLearningStorePayload(legacyResponse?.value)) {
-        return { store: this.sanitizeLearningStore(legacyResponse.value), migratedLegacy: true }
-      }
-    } catch (error) {
-      console.warn('[Home Voice Agent] Could not read legacy learning memory', error)
-    }
-
-    return { store: this.emptyLearningStore(), migratedLegacy: false }
+    this.homeLearningStore.updated_at = Math.max(
+      this.homeLearningStore.updated_at,
+      preference.updated_at,
+    )
   }
 
   private async refreshHomeLearningMemory(force: boolean): Promise<void> {
     if (!this.hass) return
 
-    if (
-      !force &&
+    const fresh =
       this.homeLearningLoaded &&
       Date.now() - this.homeLearningLastRefresh < HOME_LEARNING_REFRESH_MS
-    ) {
+
+    if (!force && fresh) return
+
+    // Once a cache exists, stale reads never hold up wake-word activation or a
+    // tool call. Refresh the backend snapshot in the background and update an
+    // active Realtime session when it arrives.
+    if (!force && this.homeLearningLoaded) {
+      void this.refreshHomeLearningMemory(true)
       return
     }
 
-    const before = JSON.stringify(this.homeLearningStore)
-    let migratedLegacy = false
-
-    try {
-      const loaded = await this.loadRemoteLearningStoreWithLegacyMigration()
-      const remote = loaded.store
-      migratedLegacy = loaded.migratedLegacy
-      this.homeLearningStore = this.mergeLearningStores(this.homeLearningStore, remote)
-      this.homeLearningLoaded = true
-      this.homeLearningLastRefresh = Date.now()
-      this.homeLearningStorageMode = 'home_assistant'
-
-      this.writeLearningFallback()
-    } catch (error) {
-      const fallback = this.readLearningFallback()
-      this.homeLearningStore = this.mergeLearningStores(this.homeLearningStore, fallback)
-      this.homeLearningLoaded = true
-      this.homeLearningLastRefresh = Date.now()
-      this.homeLearningStorageMode = 'local_fallback'
-      this.writeLearningFallback()
-
-      console.warn(
-        '[Home Voice Agent] HA user-data memory unavailable; using local fallback',
-        error,
-      )
+    if (this.homeLearningRefreshPromise) {
+      await this.homeLearningRefreshPromise
+      return
     }
 
-    if (before !== JSON.stringify(this.homeLearningStore)) {
-      this.scheduleActiveAgentLearningRefresh()
-    }
-
-    if (migratedLegacy) {
-      // Persist the migrated snapshot under the v2 key. Older frontends can keep
-      // touching v1 without corrupting the new evidence/tombstone representation.
-      this.scheduleLearningSave()
-    }
-  }
-
-  private readLearningFallback(): HomeLearningStore {
-    try {
-      const currentRaw = window.localStorage.getItem(HOME_LEARNING_LOCAL_STORAGE_KEY)
-
-      if (currentRaw) {
-        return this.sanitizeLearningStore(JSON.parse(currentRaw))
-      }
-
-      const legacyRaw = window.localStorage.getItem(HOME_LEARNING_LEGACY_LOCAL_STORAGE_KEY)
-      if (!legacyRaw) return this.emptyLearningStore()
-
-      return this.sanitizeLearningStore(JSON.parse(legacyRaw))
-    } catch {
-      return this.emptyLearningStore()
-    }
-  }
-
-  private writeLearningFallback(): void {
-    try {
-      window.localStorage.setItem(
-        HOME_LEARNING_LOCAL_STORAGE_KEY,
-        JSON.stringify(this.homeLearningStore),
-      )
-    } catch (error) {
-      console.warn('[Home Voice Agent] Could not write local learning fallback', error)
-    }
-  }
-
-  private sanitizeLearningTombstones(value: unknown): Record<string, number> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-
-    const entries: Array<[string, number]> = []
-
-    for (const [key, rawTimestamp] of Object.entries(value as Record<string, unknown>)) {
-      const validAliasKey = key.startsWith('alias:') && key.length > 'alias:'.length
-      const validPreferenceKey = key.startsWith('preference:') && key.length > 'preference:'.length
-
-      if (!validAliasKey && !validPreferenceKey) continue
-
-      if (typeof rawTimestamp !== 'number' || !Number.isFinite(rawTimestamp) || rawTimestamp <= 0) {
-        continue
-      }
-
-      entries.push([key, rawTimestamp])
-    }
-
-    return Object.fromEntries(
-      entries
-        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-        .slice(0, HOME_LEARNING_MAX_TOMBSTONES),
-    )
-  }
-
-  private learningTombstoneKey(kind: 'alias' | 'preference', id: string): string {
-    return `${kind}:${id}`
-  }
-
-  private learningTombstoneTimestamp(
-    kind: 'alias' | 'preference',
-    id: string,
-    tombstones: Record<string, number> = this.homeLearningStore.tombstones,
-  ): number {
-    return tombstones[this.learningTombstoneKey(kind, id)] ?? 0
-  }
-
-  private markLearningTombstone(kind: 'alias' | 'preference', id: string, at = Date.now()): void {
-    const key = this.learningTombstoneKey(kind, id)
-    const existing = this.homeLearningStore.tombstones[key] ?? 0
-    this.homeLearningStore.tombstones[key] = Math.max(existing, at)
-    this.homeLearningStore.tombstones = this.sanitizeLearningTombstones(
-      this.homeLearningStore.tombstones,
-    )
-  }
-
-  private nextLearningMutationTimestamp(kind: 'alias' | 'preference', id: string): number {
-    return Math.max(Date.now(), this.learningTombstoneTimestamp(kind, id) + 1)
-  }
-
-  private mergeLearningStores(
-    left: HomeLearningStore,
-    right: HomeLearningStore,
-  ): HomeLearningStore {
-    const aliases = new Map<string, LearnedEntityAlias>()
-    const preferences = new Map<string, LearnedNumericPreference>()
-    const tombstones: Record<string, number> = { ...left.tombstones }
-
-    for (const [key, timestamp] of Object.entries(right.tombstones)) {
-      tombstones[key] = Math.max(tombstones[key] ?? 0, timestamp)
-    }
-
-    for (const incoming of [...left.aliases, ...right.aliases]) {
-      const current = aliases.get(incoming.id)
-
-      if (!current) {
-        aliases.set(incoming.id, this.rebuildAliasFromEvidence({ ...incoming }))
-        continue
-      }
-
-      const newer = incoming.updated_at >= current.updated_at ? incoming : current
-      aliases.set(
-        incoming.id,
-        this.rebuildAliasFromEvidence({
-          ...current,
-          phrase: newer.phrase,
-          created_at: Math.min(current.created_at, incoming.created_at),
-          updated_at: Math.max(current.updated_at, incoming.updated_at),
-          evidence: this.dedupeAliasEvidence([...current.evidence, ...incoming.evidence]),
-        }),
-      )
-    }
-
-    for (const incoming of [...left.preferences, ...right.preferences]) {
-      const current = preferences.get(incoming.id)
-
-      if (!current) {
-        preferences.set(incoming.id, this.rebuildPreferenceFromEvidence({ ...incoming }))
-        continue
-      }
-
-      preferences.set(
-        incoming.id,
-        this.rebuildPreferenceFromEvidence({
-          ...current,
-          created_at: Math.min(current.created_at, incoming.created_at),
-          updated_at: Math.max(current.updated_at, incoming.updated_at),
-          evidence: this.dedupePreferenceEvidence([...current.evidence, ...incoming.evidence]),
-        }),
-      )
-    }
-
-    let aliasValues = [...aliases.values()]
-      .filter(
-        alias => (tombstones[this.learningTombstoneKey('alias', alias.id)] ?? 0) < alias.updated_at,
-      )
-      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
-
-    let preferenceValues = [...preferences.values()]
-      .filter(
-        preference =>
-          (tombstones[this.learningTombstoneKey('preference', preference.id)] ?? 0) <
-          preference.updated_at,
-      )
-      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
-
-    if (aliasValues.length > HOME_LEARNING_MAX_ALIASES) {
-      for (const alias of aliasValues.slice(HOME_LEARNING_MAX_ALIASES)) {
-        const key = this.learningTombstoneKey('alias', alias.id)
-        tombstones[key] = Math.max(tombstones[key] ?? 0, alias.updated_at)
-      }
-      aliasValues = aliasValues.slice(0, HOME_LEARNING_MAX_ALIASES)
-    }
-
-    if (preferenceValues.length > HOME_LEARNING_MAX_PREFERENCES) {
-      for (const preference of preferenceValues.slice(HOME_LEARNING_MAX_PREFERENCES)) {
-        const key = this.learningTombstoneKey('preference', preference.id)
-        tombstones[key] = Math.max(tombstones[key] ?? 0, preference.updated_at)
-      }
-      preferenceValues = preferenceValues.slice(0, HOME_LEARNING_MAX_PREFERENCES)
-    }
-
-    return {
-      version: 2,
-      aliases: aliasValues,
-      preferences: preferenceValues,
-      tombstones: this.sanitizeLearningTombstones(tombstones),
-      updated_at: Math.max(left.updated_at, right.updated_at),
-    }
-  }
-
-  private learningStoreContainsEvidence(
-    haystack: HomeLearningStore,
-    needle: HomeLearningStore,
-  ): boolean {
-    const aliasEvidence = new Map(
-      haystack.aliases.map(alias => [alias.id, new Set(alias.evidence.map(item => item.id))]),
-    )
-    const preferenceEvidence = new Map(
-      haystack.preferences.map(preference => [
-        preference.id,
-        new Set(preference.evidence.map(item => item.id)),
-      ]),
-    )
-
-    const containsTombstones = Object.entries(needle.tombstones).every(
-      ([key, timestamp]) => (haystack.tombstones[key] ?? 0) >= timestamp,
-    )
-
-    return (
-      containsTombstones &&
-      needle.aliases.every(alias => {
-        const tombstone = haystack.tombstones[this.learningTombstoneKey('alias', alias.id)] ?? 0
-        if (tombstone >= alias.updated_at) return true
-        return alias.evidence.every(item => aliasEvidence.get(alias.id)?.has(item.id) === true)
-      }) &&
-      needle.preferences.every(preference => {
-        const tombstone =
-          haystack.tombstones[this.learningTombstoneKey('preference', preference.id)] ?? 0
-        if (tombstone >= preference.updated_at) return true
-        return preference.evidence.every(
-          item => preferenceEvidence.get(preference.id)?.has(item.id) === true,
-        )
+    this.homeLearningRefreshPromise = (async () => {
+      const beforeSignature = this.learningContextSignature()
+      const payload = await this.hass!.callWS<unknown>({
+        type: 'home_voice_agent/memory_context',
       })
-    )
-  }
+      const context = this.sanitizeLearningContext(payload)
 
-  private scheduleLearningSave(): void {
-    this.homeLearningStore.updated_at = Date.now()
-    this.writeLearningFallback()
-    this.scheduleActiveAgentLearningRefresh()
+      this.homeLearningStore = context
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
 
-    if (this.homeLearningSaveTimer !== null) {
-      window.clearTimeout(this.homeLearningSaveTimer)
-    }
-
-    this.homeLearningSaveTimer = window.setTimeout(() => {
-      this.homeLearningSaveTimer = null
-      void this.persistLearningMemory()
-    }, HOME_LEARNING_SAVE_DEBOUNCE_MS)
-  }
-
-  private async persistLearningMemory(): Promise<void> {
-    this.homeLearningPersistRequested = true
-
-    if (this.homeLearningPersistPromise) {
-      await this.homeLearningPersistPromise
-      return
-    }
-
-    this.homeLearningPersistPromise = (async () => {
-      let attempts = 0
-
-      while (this.homeLearningPersistRequested && attempts < 3) {
-        this.homeLearningPersistRequested = false
-        attempts += 1
-        await this.persistLearningMemoryOnce()
-      }
-
-      if (this.homeLearningPersistRequested) {
-        this.homeLearningPersistRequested = false
-        window.setTimeout(
-          () => {
-            void this.persistLearningMemory()
-          },
-          250 + Math.floor(Math.random() * 250),
-        )
+      if (this.learningContextSignature(context) !== beforeSignature) {
+        this.scheduleActiveAgentLearningRefresh()
       }
     })()
 
     try {
-      await this.homeLearningPersistPromise
-    } finally {
-      this.homeLearningPersistPromise = null
-
-      if (this.homeLearningPersistRequested) {
-        void this.persistLearningMemory()
-      }
-    }
-  }
-
-  private async persistLearningMemoryOnce(): Promise<void> {
-    if (!this.hass) return
-
-    this.homeLearningStore.updated_at = Date.now()
-    this.writeLearningFallback()
-    const localSnapshot = this.sanitizeLearningStore(this.homeLearningStore)
-
-    try {
-      let remote = this.emptyLearningStore()
-
-      try {
-        const response = await this.hass.callWS<FrontendUserDataResponse>({
-          type: 'frontend/get_user_data',
-          key: HOME_LEARNING_STORAGE_KEY,
-        })
-        remote = this.sanitizeLearningStore(response?.value)
-      } catch {
-        // The write below will determine whether HA user-data storage is available.
-      }
-
-      const merged = this.mergeLearningStores(remote, localSnapshot)
-      merged.updated_at = Date.now()
-
-      await this.hass.callWS({
-        type: 'frontend/set_user_data',
-        key: HOME_LEARNING_STORAGE_KEY,
-        value: merged,
-      })
-
-      // Verify the write. A second tablet can race between our read and write;
-      // evidence IDs make that detectable and a later iteration converges safely.
-      let verified = merged
-
-      try {
-        const response = await this.hass.callWS<FrontendUserDataResponse>({
-          type: 'frontend/get_user_data',
-          key: HOME_LEARNING_STORAGE_KEY,
-        })
-        verified = this.sanitizeLearningStore(response?.value)
-      } catch {
-        // Keep the just-written merged view if verification is temporarily unavailable.
-      }
-
-      this.homeLearningStore = this.mergeLearningStores(this.homeLearningStore, verified)
-      this.homeLearningLoaded = true
-      this.homeLearningLastRefresh = Date.now()
-      this.homeLearningStorageMode = 'home_assistant'
-      this.writeLearningFallback()
-
-      if (!this.learningStoreContainsEvidence(verified, localSnapshot)) {
-        this.homeLearningPersistRequested = true
-      }
+      await this.homeLearningRefreshPromise
     } catch (error) {
-      this.homeLearningStorageMode = 'local_fallback'
-      console.warn('[Home Voice Agent] Could not persist learning memory in Home Assistant', error)
+      console.warn('[Home Voice Agent] Could not refresh backend learning memory', error)
+    } finally {
+      this.homeLearningRefreshPromise = null
     }
   }
 
@@ -2520,73 +1907,55 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
     domain: string | null
     entityId: string
     evidence: LearnedAliasEvidenceKind
-  }): Promise<void> {
+  }): Promise<boolean> {
+    if (!this.hass) return false
+
     const phrase = options.phrase.trim()
     const normalized = this.normalizeHomeName(phrase)
+    if (!normalized || normalized.length < 2 || !options.entityId.trim()) return false
 
-    if (!normalized || normalized.length < 2) return
-
-    await this.refreshHomeLearningMemory(false)
-
-    const areaName = options.areaName?.trim() || null
-    const id = this.learningAliasId(normalized, areaName, options.domain, options.entityId)
-    const now = this.nextLearningMutationTimestamp('alias', id)
-
-    if (
-      options.evidence === 'successful_action' ||
-      options.evidence === 'explicit_learning' ||
-      options.evidence === 'explicit_correction'
-    ) {
-      for (const alias of this.homeLearningStore.aliases) {
-        if (
-          alias.id !== id &&
-          alias.normalized_phrase === normalized &&
-          this.sameLearningScope(alias.area_name, areaName, alias.domain, options.domain) &&
-          alias.entity_id !== options.entityId
-        ) {
-          alias.evidence.push({
-            id: this.createLearningEvidenceId('alias-contradiction'),
-            kind: 'contradiction',
-            at: now,
-            severity: options.evidence === 'explicit_correction' ? 'explicit_correction' : 'normal',
-          })
-          Object.assign(alias, this.rebuildAliasFromEvidence(alias))
-        }
-      }
-    }
-
-    let alias = this.homeLearningStore.aliases.find(item => item.id === id)
-
-    if (!alias) {
-      alias = {
-        id,
+    try {
+      const now = Date.now()
+      const response = await this.hass.callWS<HomeMemoryAliasObservationResponse>({
+        type: 'home_voice_agent/memory_alias_observe',
         phrase,
-        normalized_phrase: normalized,
-        area_name: areaName,
-        domain: options.domain,
-        entity_id: options.entityId,
-        confidence: 0,
-        observations: 0,
-        successful_uses: 0,
-        contradictions: 0,
-        created_at: now,
-        updated_at: now,
-        last_used_at: null,
-        evidence: [],
+        area_name: options.areaName?.trim() || null,
+        domain: options.domain?.trim() || null,
+        entity_id: options.entityId.trim(),
+        evidence: options.evidence,
+        event_id: this.createLearningEventId(`alias-${options.evidence}`),
+        source_device: this.config.deviceId || null,
+        at: now,
+      })
+
+      const alias = this.sanitizeLearnedAlias(response?.alias)
+      if (alias) this.upsertLearnedAlias(alias)
+      if (typeof response?.revision === 'number' && Number.isFinite(response.revision)) {
+        this.homeLearningStore.revision = Math.max(
+          this.homeLearningStore.revision,
+          Math.trunc(response.revision),
+        )
       }
-      this.homeLearningStore.aliases.push(alias)
+
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.scheduleActiveAgentLearningRefresh()
+
+      if (
+        options.evidence === 'successful_action' ||
+        options.evidence === 'explicit_learning' ||
+        options.evidence === 'explicit_correction'
+      ) {
+        // Strong alias evidence can also reduce confidence on competing mappings
+        // server-side. Pull the full authoritative snapshot in the background.
+        void this.refreshHomeLearningMemory(true)
+      }
+
+      return true
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not persist learned alias', error)
+      return false
     }
-
-    alias.phrase = phrase
-    alias.evidence.push({
-      id: this.createLearningEvidenceId(`alias-${options.evidence}`),
-      kind: options.evidence,
-      at: now,
-    })
-    Object.assign(alias, this.rebuildAliasFromEvidence(alias))
-
-    this.trimLearningMemory()
-    this.scheduleLearningSave()
   }
 
   private async observeNumericPreference(options: {
@@ -2595,180 +1964,69 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
     areaName: string | null
     entityId: string
     evidence?: 'implicit' | 'explicit' | 'correction'
-  }): Promise<void> {
+  }): Promise<boolean> {
+    if (!this.hass) return false
+
     const value = this.sanitizePreferenceValue(options.metric, options.value)
-    if (value === null) return
+    if (value === null || !options.entityId.trim()) return false
 
-    await this.refreshHomeLearningMemory(false)
+    const evidence = options.evidence ?? 'implicit'
 
-    const areaName = options.areaName?.trim() || null
-    const id = this.learningPreferenceId(options.metric, areaName, options.entityId)
-    const now = this.nextLearningMutationTimestamp('preference', id)
-    let preference = this.homeLearningStore.preferences.find(item => item.id === id)
-
-    if (!preference) {
-      preference = {
-        id,
+    try {
+      const now = Date.now()
+      const response = await this.hass.callWS<HomeMemoryPreferenceObservationResponse>({
+        type: 'home_voice_agent/memory_preference_observe',
         metric: options.metric,
-        area_name: areaName,
-        entity_id: options.entityId,
+        area_name: options.areaName?.trim() || null,
+        entity_id: options.entityId.trim(),
         value,
-        confidence: 0,
-        observations: 0,
-        created_at: now,
-        updated_at: now,
-        last_used_at: null,
-        evidence: [],
+        evidence,
+        event_id: this.createLearningEventId(`preference-${evidence}`),
+        source_device: this.config.deviceId || null,
+        at: now,
+      })
+
+      const preference = this.sanitizeLearnedPreference(response?.preference)
+      if (preference) this.upsertLearnedPreference(preference)
+      if (typeof response?.revision === 'number' && Number.isFinite(response.revision)) {
+        this.homeLearningStore.revision = Math.max(
+          this.homeLearningStore.revision,
+          Math.trunc(response.revision),
+        )
       }
-      this.homeLearningStore.preferences.push(preference)
+
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.scheduleActiveAgentLearningRefresh()
+      return true
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not persist numeric preference', error)
+      return false
     }
-
-    const evidenceKind = options.evidence ?? 'implicit'
-    preference.evidence.push({
-      id: this.createLearningEvidenceId(`preference-${evidenceKind}`),
-      kind: evidenceKind,
-      at: now,
-      value,
-    })
-    Object.assign(preference, this.rebuildPreferenceFromEvidence(preference))
-
-    this.trimLearningMemory()
-    this.scheduleLearningSave()
-  }
-
-  private learningAliasId(
-    normalizedPhrase: string,
-    areaName: string | null,
-    domain: string | null,
-    entityId: string,
-  ): string {
-    return [
-      'alias',
-      normalizedPhrase,
-      this.normalizeHomeName(areaName || '*'),
-      domain || '*',
-      entityId,
-    ].join('|')
-  }
-
-  private learningPreferenceId(
-    metric: LearnedNumericPreference['metric'],
-    areaName: string | null,
-    entityId: string,
-  ): string {
-    return ['preference', metric, this.normalizeHomeName(areaName || '*'), entityId].join('|')
-  }
-
-  private sameLearningScope(
-    leftArea: string | null,
-    rightArea: string | null,
-    leftDomain: string | null,
-    rightDomain: string | null,
-  ): boolean {
-    return (
-      this.normalizeHomeName(leftArea || '*') === this.normalizeHomeName(rightArea || '*') &&
-      (leftDomain || '*') === (rightDomain || '*')
-    )
-  }
-
-  private clampConfidence(value: number): number {
-    return Math.max(0, Math.min(0.99, value))
-  }
-
-  private trimLearningMemory(): void {
-    const aliases = [...this.homeLearningStore.aliases].sort(
-      (a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at,
-    )
-    const preferences = [...this.homeLearningStore.preferences].sort(
-      (a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at,
-    )
-
-    for (const alias of aliases.slice(HOME_LEARNING_MAX_ALIASES)) {
-      this.markLearningTombstone('alias', alias.id, alias.updated_at)
-    }
-
-    for (const preference of preferences.slice(HOME_LEARNING_MAX_PREFERENCES)) {
-      this.markLearningTombstone('preference', preference.id, preference.updated_at)
-    }
-
-    this.homeLearningStore.aliases = aliases.slice(0, HOME_LEARNING_MAX_ALIASES)
-    this.homeLearningStore.preferences = preferences.slice(0, HOME_LEARNING_MAX_PREFERENCES)
   }
 
   private async reconcileLearningMemoryWithCatalog(catalog: HomeCatalogEntity[]): Promise<void> {
-    if (!this.homeLearningLoaded) {
-      await this.refreshHomeLearningMemory(false)
-    }
+    if (!this.hass || catalog.length === 0) return
 
-    if (!this.homeLearningLoaded || catalog.length === 0) return
-
-    const entityIds = new Set(catalog.map(entity => entity.entity_id))
-    const learnedEntityIds = new Set([
-      ...this.homeLearningStore.aliases.map(alias => alias.entity_id),
-      ...this.homeLearningStore.preferences.map(preference => preference.entity_id),
-    ])
-
-    for (const entityId of learnedEntityIds) {
-      if (entityIds.has(entityId)) {
-        this.homeLearningMissingCatalogCounts.delete(entityId)
-      } else {
-        this.homeLearningMissingCatalogCounts.set(
-          entityId,
-          (this.homeLearningMissingCatalogCounts.get(entityId) ?? 0) + 1,
-        )
-      }
-    }
-
-    const staleEntityIds = new Set(
-      [...this.homeLearningMissingCatalogCounts.entries()]
-        .filter(([, misses]) => misses >= HOME_LEARNING_STALE_REFRESH_LIMIT)
-        .map(([entityId]) => entityId),
-    )
-
-    if (staleEntityIds.size === 0) return
-
-    const aliasesBefore = this.homeLearningStore.aliases.length
-    const preferencesBefore = this.homeLearningStore.preferences.length
-
-    const removedAt = Date.now()
-
-    for (const alias of this.homeLearningStore.aliases) {
-      if (staleEntityIds.has(alias.entity_id)) {
-        this.markLearningTombstone('alias', alias.id, Math.max(removedAt, alias.updated_at))
-      }
-    }
-
-    for (const preference of this.homeLearningStore.preferences) {
-      if (staleEntityIds.has(preference.entity_id)) {
-        this.markLearningTombstone(
-          'preference',
-          preference.id,
-          Math.max(removedAt, preference.updated_at),
-        )
-      }
-    }
-
-    this.homeLearningStore.aliases = this.homeLearningStore.aliases.filter(
-      alias => !staleEntityIds.has(alias.entity_id),
-    )
-    this.homeLearningStore.preferences = this.homeLearningStore.preferences.filter(
-      preference => !staleEntityIds.has(preference.entity_id),
-    )
-
-    for (const entityId of staleEntityIds) {
-      this.homeLearningMissingCatalogCounts.delete(entityId)
-    }
-
-    if (
-      aliasesBefore !== this.homeLearningStore.aliases.length ||
-      preferencesBefore !== this.homeLearningStore.preferences.length
-    ) {
-      console.info('[Home Voice Agent] Removed persistently stale learned home references', {
-        aliases: aliasesBefore - this.homeLearningStore.aliases.length,
-        preferences: preferencesBefore - this.homeLearningStore.preferences.length,
-        requiredConsecutiveMisses: HOME_LEARNING_STALE_REFRESH_LIMIT,
+    try {
+      const result = await this.hass.callWS<HomeMemoryReconcileResponse>({
+        type: 'home_voice_agent/memory_catalog_reconcile',
+        entity_ids: catalog.map(entity => entity.entity_id),
+        at: Date.now(),
       })
-      this.scheduleLearningSave()
+
+      const removedAliases = this.safeNonNegativeInteger(result?.removed_aliases)
+      const removedPreferences = this.safeNonNegativeInteger(result?.removed_preferences)
+
+      if (removedAliases > 0 || removedPreferences > 0) {
+        await this.refreshHomeLearningMemory(true)
+        console.info('[Home Voice Agent] Backend removed persistently stale learned references', {
+          aliases: removedAliases,
+          preferences: removedPreferences,
+        })
+      }
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not reconcile backend learning memory', error)
     }
   }
 
@@ -2802,7 +2060,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
         this.homeKnowledgeLastRefresh = Date.now()
         this.homeKnowledgeVersion += 1
 
-        await this.reconcileLearningMemoryWithCatalog(catalog)
+        void this.reconcileLearningMemoryWithCatalog(catalog)
 
         console.info('[Home Voice Agent] Home knowledge refreshed', {
           reason,
@@ -2905,9 +2163,10 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       subscribe('device_registry_updated', () =>
         this.scheduleHomeKnowledgeRefresh('device registry changed'),
       ),
-      subscribe('area_registry_updated', () =>
-        this.scheduleHomeKnowledgeRefresh('area registry changed'),
-      ),
+      subscribe('area_registry_updated', () => {
+        this.homeAreasLastRefresh = 0
+        this.scheduleHomeKnowledgeRefresh('area registry changed')
+      }),
       subscribe('service_registered', () =>
         this.scheduleHomeKnowledgeRefresh('service registered'),
       ),
@@ -3850,7 +3109,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       .filter(
         alias =>
           alias.normalized_phrase === query &&
-          alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE &&
+          alias.confidence >= this.homeLearningDirectConfidence &&
           candidates.some(entity => entity.entity_id === alias.entity_id),
       )
       .sort(
@@ -3868,9 +3127,6 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
         learnedDirect[0].entity_id === learnedDirect[1].entity_id)
     ) {
       const winner = learnedDirect[0]
-      winner.last_used_at = Date.now()
-      winner.updated_at = Date.now()
-      this.scheduleLearningSave()
       return [winner.entity_id]
     }
 
@@ -3905,16 +3161,37 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
     )
   }
 
-  private async getHomeAreas(): Promise<HomeAreaEntry[]> {
+  private async getHomeAreas(force = false): Promise<HomeAreaEntry[]> {
     if (!this.hass) {
       throw new Error('Home Assistant is not connected.')
     }
 
-    const areas = await this.hass.callWS<HomeAreaEntry[]>({
-      type: 'config/area_registry/list',
-    })
+    if (
+      !force &&
+      this.homeAreasLastRefresh > 0 &&
+      Date.now() - this.homeAreasLastRefresh < HOME_AREAS_CACHE_MS
+    ) {
+      return this.homeAreasCache
+    }
 
-    return Array.isArray(areas) ? areas : []
+    if (this.homeAreasRefreshPromise) {
+      return this.homeAreasRefreshPromise
+    }
+
+    this.homeAreasRefreshPromise = (async () => {
+      const areas = await this.hass!.callWS<HomeAreaEntry[]>({
+        type: 'config/area_registry/list',
+      })
+      this.homeAreasCache = Array.isArray(areas) ? areas : []
+      this.homeAreasLastRefresh = Date.now()
+      return this.homeAreasCache
+    })()
+
+    try {
+      return await this.homeAreasRefreshPromise
+    } finally {
+      this.homeAreasRefreshPromise = null
+    }
   }
 
   private async resolveHomeAreaId(areaName: string): Promise<string> {

@@ -22,9 +22,10 @@ type KioskWakeState = {
 
 type KioskSatelliteApi = {
   platform?: string
-  setWakeWordConfig(
-    config: KioskWakeConfig,
-  ): Promise<{ available?: boolean; stopWordAvailable?: boolean } | null>
+  setWakeWordConfig(config: KioskWakeConfig): Promise<{
+    available?: boolean
+    stopWordAvailable?: boolean
+  } | null>
   setWakeWordActive(active: boolean): Promise<boolean | null>
   releaseWakeWord(options: { reason: 'muted' | 'browser' }): Promise<boolean | null>
   getWakeWordState(): Promise<KioskWakeState | null>
@@ -44,10 +45,7 @@ const WAKE_CONFIG: KioskWakeConfig = {
 
 function kioskSatellite(): KioskSatelliteApi | null {
   const kiosk = window.kioskSatellite
-
-  if (!kiosk || kiosk.platform !== 'kiosksatellite') {
-    return null
-  }
+  if (!kiosk || kiosk.platform !== 'kiosksatellite') return null
 
   return kiosk
 }
@@ -98,6 +96,13 @@ if (!window.homeVoiceAgent) {
 
 const agent = window.homeVoiceAgent
 
+/*
+ * Before the browser voice agent starts using the microphone,
+ * release it from Kiosk Satellite.
+ *
+ * With the optimized controller this preparation runs in parallel
+ * with token/context/area preparation.
+ */
 agent.setPrepareInputHook(async () => {
   const kiosk = kioskSatellite()
   if (!kiosk) return
@@ -111,6 +116,13 @@ agent.setPrepareInputHook(async () => {
   }
 })
 
+/*
+ * Wake-word event.
+ *
+ * Do NOT pass inputReady: true here.
+ * agent.start() must execute prepareInputHook so Kiosk Satellite
+ * releases its microphone before Realtime takes control.
+ */
 if (!window.__homeVoiceAgentKioskWakeBound) {
   window.__homeVoiceAgentKioskWakeBound = true
 
@@ -128,12 +140,16 @@ if (!window.__homeVoiceAgentKioskWakeBound) {
       detail?.model ?? '',
     )
 
-    void agent.start({
-      inputReady: true,
-    })
+    void agent.start()
   })
 }
 
+/*
+ * Keep Kiosk Satellite informed about the voice-agent lifecycle.
+ *
+ * While Realtime is active, interaction mode stays enabled.
+ * When the agent returns to idle, wake-word listening resumes.
+ */
 if (!window.__homeVoiceAgentStateBound) {
   window.__homeVoiceAgentStateBound = true
 
@@ -166,6 +182,9 @@ if (!window.__homeVoiceAgentStateBound) {
   })
 }
 
+/*
+ * Configure the wake engine once when the frontend initializes.
+ */
 if (!window.__homeVoiceAgentKioskWakeConfigured && !window.__homeVoiceAgentKioskWakeSetupPromise) {
   window.__homeVoiceAgentKioskWakeSetupPromise = configureKioskWakeWord()
     .then(ready => {
@@ -180,7 +199,7 @@ if (!window.__homeVoiceAgentKioskWakeConfigured && !window.__homeVoiceAgentKiosk
 }
 
 console.info(
-  '%c HOME VOICE AGENT %c v0.3.0 ',
+  '%c HOME VOICE AGENT %c v0.4.0 ',
   'color:#fff;background:#596d87;font-weight:700;padding:3px 6px',
   'color:#596d87;background:#fff;font-weight:700;padding:3px 6px',
 )
