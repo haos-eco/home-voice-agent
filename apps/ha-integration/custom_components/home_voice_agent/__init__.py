@@ -62,6 +62,17 @@ _PREFERENCE_EVIDENCE = [
     "correction",
 ]
 
+_MEMORY_CATEGORIES = [
+    "household_fact",
+    "user_preference",
+    "assistant_behavior",
+]
+
+_MEMORY_SCOPES = [
+    "household",
+    "user",
+]
+
 
 async def async_setup(
         hass: HomeAssistant,
@@ -92,6 +103,9 @@ async def async_setup(
             websocket_memory_diagnostics,
             websocket_memory_alias_observe,
             websocket_memory_preference_observe,
+            websocket_memory_remember,
+            websocket_memory_recall,
+            websocket_memory_forget,
             websocket_memory_catalog_reconcile,
             websocket_memory_import,
     ):
@@ -489,6 +503,202 @@ async def websocket_memory_preference_observe(
         msg,
         method="POST",
         path="/internal/memory/preference/observe",
+        json_body=body,
+    )
+
+    if payload is None:
+        return
+
+    connection.send_result(
+        msg["id"],
+        payload,
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required(
+            "type"
+        ): "home_voice_agent/memory_remember",
+        vol.Required(
+            "scope"
+        ): vol.In(
+            _MEMORY_SCOPES
+        ),
+        vol.Required(
+            "category"
+        ): vol.In(
+            _MEMORY_CATEGORIES
+        ),
+        vol.Optional(
+            "memory_key",
+            default=None,
+        ): vol.Any(
+            None,
+            cv.string,
+        ),
+        vol.Required(
+            "content"
+        ): cv.string,
+        vol.Optional(
+            "event_id"
+        ): cv.string,
+        vol.Optional(
+            "source_device",
+            default=None,
+        ): vol.Any(
+            None,
+            cv.string,
+        ),
+        vol.Optional(
+            "at"
+        ): vol.Coerce(int),
+    }
+)
+@websocket_api.async_response
+async def websocket_memory_remember(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Persist an explicit durable assistant memory."""
+
+    body = {
+        "scope": msg["scope"],
+        "category": msg["category"],
+        "memory_key": msg["memory_key"],
+        "content": msg["content"],
+        "source": "explicit_user",
+        "source_device": msg["source_device"],
+    }
+
+    if "event_id" in msg:
+        body["event_id"] = msg["event_id"]
+
+    if "at" in msg:
+        body["at"] = msg["at"]
+
+    payload = await _async_backend_request(
+        hass,
+        connection,
+        msg,
+        method="POST",
+        path="/internal/memory/remember",
+        json_body=body,
+    )
+
+    if payload is None:
+        return
+
+    connection.send_result(
+        msg["id"],
+        payload,
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required(
+            "type"
+        ): "home_voice_agent/memory_recall",
+        vol.Required(
+            "query"
+        ): cv.string,
+        vol.Optional(
+            "categories",
+            default=[],
+        ): [
+            vol.In(
+                _MEMORY_CATEGORIES
+            )
+        ],
+        vol.Optional(
+            "limit",
+            default=8,
+        ): vol.All(
+            vol.Coerce(int),
+            vol.Range(min=1, max=20),
+        ),
+    }
+)
+@websocket_api.async_response
+async def websocket_memory_recall(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Retrieve relevant durable assistant memories."""
+
+    payload = await _async_backend_request(
+        hass,
+        connection,
+        msg,
+        method="POST",
+        path="/internal/memory/recall",
+        json_body={
+            "query": msg["query"],
+            "categories": msg["categories"],
+            "limit": msg["limit"],
+        },
+    )
+
+    if payload is None:
+        return
+
+    connection.send_result(
+        msg["id"],
+        payload,
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required(
+            "type"
+        ): "home_voice_agent/memory_forget",
+        vol.Required(
+            "memory_id"
+        ): cv.string,
+        vol.Optional(
+            "event_id"
+        ): cv.string,
+        vol.Optional(
+            "source_device",
+            default=None,
+        ): vol.Any(
+            None,
+            cv.string,
+        ),
+        vol.Optional(
+            "at"
+        ): vol.Coerce(int),
+    }
+)
+@websocket_api.async_response
+async def websocket_memory_forget(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Forget one durable assistant memory."""
+
+    body = {
+        "memory_id": msg["memory_id"],
+        "source_device": msg["source_device"],
+    }
+
+    if "event_id" in msg:
+        body["event_id"] = msg["event_id"]
+
+    if "at" in msg:
+        body["at"] = msg["at"]
+
+    payload = await _async_backend_request(
+        hass,
+        connection,
+        msg,
+        method="POST",
+        path="/internal/memory/forget",
         json_body=body,
     )
 

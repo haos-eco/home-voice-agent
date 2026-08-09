@@ -1,9 +1,13 @@
-import type { FastifyInstance, FastifyReply, preHandlerHookHandler } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify'
 
 import {
   HomeVoiceMemoryStore,
   type AliasObservation,
   type PreferenceObservation,
+  type SemanticMemoryCategory,
+  type SemanticMemoryForget,
+  type SemanticMemoryRecall,
+  type SemanticMemoryWrite,
 } from './memory-store.js'
 
 type MemoryPreHandler = preHandlerHookHandler
@@ -24,13 +28,17 @@ function badRequest(reply: FastifyReply, error: unknown): FastifyReply {
   })
 }
 
+function homeAssistantUserId(request: FastifyRequest): string | null {
+  const raw = request.headers['x-home-assistant-user-id']
+  if (Array.isArray(raw)) return raw[0]?.trim() || null
+  return typeof raw === 'string' ? raw.trim() || null : null
+}
+
 export async function registerMemoryRoutes(
   app: FastifyInstance,
   options: RegisterMemoryRoutesOptions,
 ): Promise<void> {
-  const protectedRoute = {
-    preHandler: options.preHandler,
-  }
+  const protectedRoute = { preHandler: options.preHandler }
 
   app.get('/internal/memory/context', protectedRoute, async (request, reply) => {
     try {
@@ -40,6 +48,7 @@ export async function registerMemoryRoutes(
         ok: true,
         ...options.store.getContext({
           includeLowConfidence: query?.trusted_only !== '1',
+          userId: homeAssistantUserId(request),
         }),
       }
     } catch (error) {
@@ -70,6 +79,57 @@ export async function registerMemoryRoutes(
   app.post('/internal/memory/preference/observe', protectedRoute, async (request, reply) => {
     try {
       return options.store.observePreference(request.body as PreferenceObservation)
+    } catch (error) {
+      return badRequest(reply, error)
+    }
+  })
+
+  app.post('/internal/memory/remember', protectedRoute, async (request, reply) => {
+    try {
+      const body = (request.body ?? {}) as Omit<SemanticMemoryWrite, 'user_id'>
+      return options.store.rememberMemory({
+        ...body,
+        user_id: homeAssistantUserId(request),
+      })
+    } catch (error) {
+      return badRequest(reply, error)
+    }
+  })
+
+  app.post('/internal/memory/recall', protectedRoute, async (request, reply) => {
+    try {
+      const body = (request.body ?? {}) as {
+        query?: unknown
+        categories?: unknown
+        limit?: unknown
+      }
+      const categories = Array.isArray(body.categories)
+        ? body.categories.filter(
+            (value): value is SemanticMemoryCategory =>
+              value === 'household_fact' ||
+              value === 'user_preference' ||
+              value === 'assistant_behavior',
+          )
+        : undefined
+      const input: SemanticMemoryRecall = {
+        query: typeof body.query === 'string' ? body.query : '',
+        categories,
+        limit: typeof body.limit === 'number' ? body.limit : undefined,
+        user_id: homeAssistantUserId(request),
+      }
+      return options.store.recallMemories(input)
+    } catch (error) {
+      return badRequest(reply, error)
+    }
+  })
+
+  app.post('/internal/memory/forget', protectedRoute, async (request, reply) => {
+    try {
+      const body = (request.body ?? {}) as Omit<SemanticMemoryForget, 'user_id'>
+      return options.store.forgetMemory({
+        ...body,
+        user_id: homeAssistantUserId(request),
+      })
     } catch (error) {
       return badRequest(reply, error)
     }

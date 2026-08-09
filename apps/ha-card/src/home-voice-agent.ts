@@ -148,13 +148,52 @@ type HomeLearningThresholds = {
   alias_boost_confidence: number
 }
 
+type DurableMemoryScope = 'household' | 'user'
+type DurableMemoryCategory = 'household_fact' | 'user_preference' | 'assistant_behavior'
+type DurableMemorySource = 'explicit_user' | 'system'
+
+type DurableMemory = {
+  id: string
+  scope: DurableMemoryScope
+  user_id: string | null
+  category: DurableMemoryCategory
+  memory_key: string | null
+  content: string
+  normalized_content: string
+  confidence: number
+  source: DurableMemorySource
+  priority: number
+  created_at: number
+  updated_at: number
+  last_used_at: number | null
+  use_count: number
+}
+
 type HomeLearningStore = {
-  version: 1
+  version: 2
   revision: number
   thresholds: HomeLearningThresholds
   aliases: LearnedEntityAlias[]
   preferences: LearnedNumericPreference[]
+  memories: DurableMemory[]
   updated_at: number
+}
+
+type MemoryRememberArgs = {
+  scope: DurableMemoryScope
+  category: DurableMemoryCategory
+  memory_key: string | null
+  content: string
+}
+
+type MemoryRecallArgs = {
+  query: string
+  categories: DurableMemoryCategory[]
+  limit: number
+}
+
+type MemoryForgetArgs = {
+  memory_id: string
 }
 
 type HomeMemoryAliasObservationResponse = {
@@ -179,6 +218,28 @@ type HomeMemoryReconcileResponse = {
   entity_count?: number
   removed_aliases?: number
   removed_preferences?: number
+}
+
+type DurableMemoryRememberResponse = {
+  ok?: boolean
+  duplicate?: boolean
+  event_id?: string
+  revision?: number
+  memory?: DurableMemory | null
+}
+
+type DurableMemoryRecallResponse = {
+  ok?: boolean
+  memories?: DurableMemory[]
+}
+
+type DurableMemoryForgetResponse = {
+  ok?: boolean
+  duplicate?: boolean
+  event_id?: string
+  revision?: number
+  removed?: boolean
+  memory_id?: string
 }
 
 type UserSpeechTranscript = {
@@ -507,6 +568,77 @@ const HOME_LEARNING_OBSERVE_PARAMETERS = {
   required: ['kind', 'phrase', 'area', 'domain', 'entity', 'metric', 'value', 'correction'],
 } as const
 
+const MEMORY_REMEMBER_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    scope: {
+      type: 'string',
+      enum: ['household', 'user'],
+      description:
+        'Use household for facts shared by the home. Use user for an individual preference or assistant behavior preference tied to the current Home Assistant user.',
+    },
+    category: {
+      type: 'string',
+      enum: ['household_fact', 'user_preference', 'assistant_behavior'],
+      description:
+        'household_fact is a durable fact about the home/household; user_preference is a durable individual preference; assistant_behavior controls how the assistant should respond or behave.',
+    },
+    memory_key: {
+      type: ['string', 'null'],
+      description:
+        'A short stable semantic key when this memory may later be replaced, for example routine_response_style or battery_backup_goal. Use the same key when updating the same fact. Use null when no stable key is appropriate.',
+    },
+    content: {
+      type: 'string',
+      description:
+        'A concise self-contained durable fact or preference. Store the meaning, not conversational filler.',
+    },
+  },
+  required: ['scope', 'category', 'memory_key', 'content'],
+} as const
+
+const MEMORY_RECALL_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    query: {
+      type: 'string',
+      description:
+        'Natural-language description of the durable fact or preference needed for the current request.',
+    },
+    categories: {
+      type: 'array',
+      items: {
+        type: 'string',
+        enum: ['household_fact', 'user_preference', 'assistant_behavior'],
+      },
+      description:
+        'Relevant categories, or an empty array to search all durable memory categories.',
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 12,
+      description: 'Maximum number of memories to retrieve. Usually 4 to 8 is enough.',
+    },
+  },
+  required: ['query', 'categories', 'limit'],
+} as const
+
+const MEMORY_FORGET_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    memory_id: {
+      type: 'string',
+      description:
+        'Exact durable memory id to forget. Use a memory id already present in context or returned by memory_recall. Never guess an id.',
+    },
+  },
+  required: ['memory_id'],
+} as const
+
 const HOME_SENSITIVE_CONTROL_PARAMETERS = {
   type: 'object',
   additionalProperties: false,
@@ -624,6 +756,23 @@ Targeting rules are important:
 - If the user corrects a previous interpretation, call home_learning_observe with correction=true so the old mapping loses confidence quickly.
 - Do NOT call the learning tool for jokes, hypothetical statements, one-off temporary values, or facts unrelated to operating the home.
 - Learned mappings are hints, not reality. Home Assistant's current catalog always wins if an entity is removed, renamed, moved, or no longer exposes the required capability.
+
+# Persistent Memory
+
+You also have durable semantic memory for household facts, user preferences, and assistant-behavior preferences.
+- Durable semantic memory is DIFFERENT from the automatic home alias/numeric learning above.
+- Only call memory_remember when the user explicitly asks you to remember/store/note something for the future, or explicitly establishes a persistent future rule such as "da ora in poi", "sempre", or "non fare mai".
+- Do NOT persist ordinary conversation, temporary plans, jokes, guesses, hypotheticals, or casual personal facts merely because they might be useful later. Those remain in the current Realtime conversation only.
+- Do NOT infer durable personal facts from incidental speech.
+- For sensitive personal, health, security, financial, or similarly private information, persist it only when the user explicitly asks you to remember that exact information.
+- Use category household_fact for durable facts about the home/household that should be shared across endpoints.
+- Use category user_preference for an individual user's durable preference.
+- Use category assistant_behavior for persistent rules about how you should answer or behave; normally use user scope unless the user explicitly makes the rule household-wide.
+- Prefer a short stable memory_key for facts/preferences likely to be updated later. Reuse the same key to replace the previous value rather than creating duplicates.
+- Use memory_recall when a request may depend on a durable fact not already present in the compact persistent-memory context.
+- If the user asks you to forget something and you do not already have its exact memory_id, use memory_recall first, then memory_forget with the exact returned id.
+- Never invent a memory, memory id, or claim that something was remembered/forgotten unless the corresponding tool succeeds.
+- Durable memory is contextual knowledge, not live Home Assistant state. Current Home Assistant state and the sensitive-action confirmation rules always take precedence.
 - Learning NEVER bypasses confirmation rules for gates, locks, doors, alarms, garage access, or other sensitive targets.
 - When a device reference is generic or you are not sure which entity it means, call home_find_entities first. Search the explicitly named room, otherwise the current tablet room first.
 - Prefer the single obvious candidate. Ask a short clarification only when multiple candidates remain genuinely plausible.
@@ -678,11 +827,12 @@ export class HomeVoiceAgentController {
   private homeKnowledgeUnsubscribers: Array<() => Promise<void>> = []
 
   private homeLearningStore: HomeLearningStore = {
-    version: 1,
+    version: 2,
     revision: 0,
     thresholds: { ...DEFAULT_HOME_LEARNING_THRESHOLDS },
     aliases: [],
     preferences: [],
+    memories: [],
     updated_at: 0,
   }
   private homeLearningLoaded = false
@@ -787,18 +937,21 @@ export class HomeVoiceAgentController {
         return [] as HomeAreaEntry[]
       })
 
-      const [credential, homeAreas] = await Promise.all([
-        credentialPreparation,
-        homeAreasPreparation,
-        inputPreparation,
-        memoryPreparation,
-      ])
+      // Only the microphone handoff and Realtime credential are true connection
+      // prerequisites. Memory and HA area metadata are preloaded on bind and can
+      // safely finish in the background; if they change, the active agent gets a
+      // live instruction refresh after connection. This keeps wake latency out of
+      // the SQLite/HA metadata path entirely.
+      const [credential] = await Promise.all([credentialPreparation, inputPreparation])
+      const homeAreas = this.homeAreasCache
 
       console.debug('[Home Voice Agent] Startup prerequisites ready', {
         elapsedMs: Math.round(performance.now() - startupStartedAt),
         memoryLoaded: this.homeLearningLoaded,
         memoryRevision: this.homeLearningStore.revision,
-        cachedAreas: this.homeAreasCache.length,
+        cachedAreas: homeAreas.length,
+        backgroundMemoryRefresh: !this.homeLearningLoaded,
+        backgroundAreaRefresh: homeAreas.length === 0,
       })
 
       const audioElement = document.createElement('audio')
@@ -896,6 +1049,12 @@ export class HomeVoiceAgentController {
 
       await session.connect({
         apiKey: credential.value,
+      })
+
+      void Promise.allSettled([memoryPreparation, homeAreasPreparation]).then(() => {
+        if (this.session === session) {
+          this.scheduleActiveAgentLearningRefresh()
+        }
       })
     } catch (error) {
       console.error('[Home Voice Agent] Connection failed', error)
@@ -1084,6 +1243,7 @@ export class HomeVoiceAgentController {
         alias => alias.confidence >= this.homeLearningDirectConfidence,
       ).length,
       learnedPreferences: this.homeLearningStore.preferences.length,
+      durableMemories: this.homeLearningStore.memories.length,
       learningStoreVersion: this.homeLearningStore.version,
       learningRevision: this.homeLearningStore.revision,
       learningStorage: 'backend_sqlite',
@@ -1114,32 +1274,58 @@ ${learnedContext}`
     const aliases = this.homeLearningStore.aliases
       .filter(alias => alias.confidence >= this.homeLearningDirectConfidence)
       .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
-      .slice(0, 24)
+      .slice(0, 20)
       .map(alias => {
         const area = alias.area_name ? ` in ${alias.area_name}` : ''
-        return `- "${alias.phrase}"${area} -> ${alias.entity_id} (confidence ${alias.confidence.toFixed(2)})`
+        return `- "${alias.phrase}"${area} -> ${alias.entity_id}`
       })
 
     const preferences = this.homeLearningStore.preferences
       .filter(preference => preference.confidence >= this.homeLearningPreferenceContextConfidence)
       .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
-      .slice(0, 16)
+      .slice(0, 12)
       .map(preference => {
         const area = preference.area_name ? ` in ${preference.area_name}` : ''
-        return `- ${preference.metric}${area} for ${preference.entity_id}: ${Number(preference.value.toFixed(3))} (confidence ${preference.confidence.toFixed(2)})`
+        return `- ${preference.metric}${area} for ${preference.entity_id}: ${Number(preference.value.toFixed(3))}`
       })
 
-    if (aliases.length === 0 && preferences.length === 0) {
-      return '- No high-confidence learned household mappings are available yet.'
+    const memories = this.homeLearningStore.memories
+      .slice()
+      .sort((a, b) => b.priority - a.priority || b.updated_at - a.updated_at)
+      .slice(0, 12)
+      .map(memory => {
+        const key = memory.memory_key ? ` key=${memory.memory_key}` : ''
+        return `- [${memory.id}] (${memory.category}/${memory.scope}${key}) ${memory.content}`
+      })
+
+    if (aliases.length === 0 && preferences.length === 0 && memories.length === 0) {
+      return '- No persistent household/user memory is available yet.'
     }
 
-    return `# Learned household context
+    return `# Persistent context
 
-These are persistent learned hints from repeated successful use. They never override current Home Assistant reality or sensitive-action confirmation.
+This compact context is loaded from the backend SQLite memory store. Treat it as durable context, not live Home Assistant state.
 
-${aliases.length > 0 ? `Learned aliases:\n${aliases.join('\n')}` : 'Learned aliases: none yet.'}
+${
+  memories.length > 0
+    ? `Durable semantic memories:
+${memories.join('\n')}`
+    : 'Durable semantic memories: none yet.'
+}
 
-${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n')}` : 'Learned numeric preferences: none yet.'}`
+${
+  aliases.length > 0
+    ? `Learned home aliases:
+${aliases.join('\n')}`
+    : 'Learned home aliases: none yet.'
+}
+
+${
+  preferences.length > 0
+    ? `Learned numeric home preferences:
+${preferences.join('\n')}`
+    : 'Learned numeric home preferences: none yet.'
+}`
   }
 
   private scheduleActiveAgentLearningRefresh(): void {
@@ -1243,6 +1429,33 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       execute: async input => this.executeHomeLearningObserve(input as HomeLearningObserveArgs),
     })
 
+    const memoryRemember = tool({
+      name: 'memory_remember',
+      description:
+        'Persist a durable semantic memory only when the user explicitly asks to remember/store something for the future or explicitly establishes a persistent future rule. Do not use for ordinary conversation. Home Assistant aliases and numeric device preferences belong in home_learning_observe instead.',
+      parameters: MEMORY_REMEMBER_PARAMETERS as any,
+      strict: true,
+      execute: async input => this.executeMemoryRemember(input as MemoryRememberArgs),
+    })
+
+    const memoryRecall = tool({
+      name: 'memory_recall',
+      description:
+        'Retrieve relevant durable household facts, user preferences, or assistant-behavior preferences when the compact startup context may not contain what the current request needs.',
+      parameters: MEMORY_RECALL_PARAMETERS as any,
+      strict: true,
+      execute: async input => this.executeMemoryRecall(input as MemoryRecallArgs),
+    })
+
+    const memoryForget = tool({
+      name: 'memory_forget',
+      description:
+        "Forget one exact durable memory at the user's explicit request. The memory_id must come from persistent context or memory_recall; never guess it.",
+      parameters: MEMORY_FORGET_PARAMETERS as any,
+      strict: true,
+      execute: async input => this.executeMemoryForget(input as MemoryForgetArgs),
+    })
+
     const sensitiveControl = tool({
       name: 'home_sensitive_control',
       description:
@@ -1269,7 +1482,165 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       },
     })
 
-    return [findEntities, control, learningObserve, sensitiveControl, status, listAreas]
+    return [
+      findEntities,
+      control,
+      learningObserve,
+      memoryRemember,
+      memoryRecall,
+      memoryForget,
+      sensitiveControl,
+      status,
+      listAreas,
+    ]
+  }
+
+  private async executeMemoryRemember(args: MemoryRememberArgs): Promise<string> {
+    if (!this.hass) {
+      return JSON.stringify({ ok: false, error: 'Home Assistant is not connected.' })
+    }
+
+    const content = args.content?.trim()
+    if (!content || content.length < 3) {
+      return JSON.stringify({ ok: false, error: 'Durable memory content is required.' })
+    }
+
+    try {
+      const response = await this.hass.callWS<DurableMemoryRememberResponse>({
+        type: 'home_voice_agent/memory_remember',
+        scope: args.scope,
+        category: args.category,
+        memory_key: args.memory_key?.trim() || null,
+        content,
+        event_id: this.createLearningEventId('memory-remember'),
+        source_device: this.config.deviceId || null,
+        at: Date.now(),
+      })
+
+      const memory = this.sanitizeDurableMemory(response?.memory)
+      if (!response?.ok || !memory) {
+        return JSON.stringify({ ok: false, error: 'Could not persist durable memory.' })
+      }
+
+      this.upsertDurableMemory(memory)
+      if (typeof response.revision === 'number' && Number.isFinite(response.revision)) {
+        this.homeLearningStore.revision = Math.max(
+          this.homeLearningStore.revision,
+          Math.trunc(response.revision),
+        )
+      }
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.scheduleActiveAgentLearningRefresh()
+      void this.refreshHomeLearningMemory(true)
+
+      return JSON.stringify({
+        ok: true,
+        remembered: {
+          id: memory.id,
+          scope: memory.scope,
+          category: memory.category,
+          memory_key: memory.memory_key,
+          content: memory.content,
+        },
+      })
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not persist durable memory', error)
+      return JSON.stringify({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  private async executeMemoryRecall(args: MemoryRecallArgs): Promise<string> {
+    if (!this.hass) {
+      return JSON.stringify({ ok: false, error: 'Home Assistant is not connected.' })
+    }
+
+    try {
+      const response = await this.hass.callWS<DurableMemoryRecallResponse>({
+        type: 'home_voice_agent/memory_recall',
+        query: args.query?.trim() || '',
+        categories: Array.isArray(args.categories) ? args.categories : [],
+        limit: Math.max(1, Math.min(12, Math.trunc(args.limit || 6))),
+      })
+      const memories = Array.isArray(response?.memories)
+        ? response.memories
+            .map(value => this.sanitizeDurableMemory(value))
+            .filter((value): value is DurableMemory => value !== null)
+        : []
+
+      return JSON.stringify({
+        ok: true,
+        memories: memories.map(memory => ({
+          id: memory.id,
+          scope: memory.scope,
+          category: memory.category,
+          memory_key: memory.memory_key,
+          content: memory.content,
+          updated_at: memory.updated_at,
+        })),
+      })
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not recall durable memory', error)
+      return JSON.stringify({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  private async executeMemoryForget(args: MemoryForgetArgs): Promise<string> {
+    if (!this.hass) {
+      return JSON.stringify({ ok: false, error: 'Home Assistant is not connected.' })
+    }
+
+    const memoryId = args.memory_id?.trim()
+    if (!memoryId) {
+      return JSON.stringify({ ok: false, error: 'memory_id is required.' })
+    }
+
+    try {
+      const response = await this.hass.callWS<DurableMemoryForgetResponse>({
+        type: 'home_voice_agent/memory_forget',
+        memory_id: memoryId,
+        event_id: this.createLearningEventId('memory-forget'),
+        source_device: this.config.deviceId || null,
+        at: Date.now(),
+      })
+
+      if (!response?.ok) {
+        return JSON.stringify({ ok: false, error: 'Could not forget durable memory.' })
+      }
+
+      if (response.removed) {
+        this.homeLearningStore.memories = this.homeLearningStore.memories.filter(
+          memory => memory.id !== memoryId,
+        )
+        if (typeof response.revision === 'number' && Number.isFinite(response.revision)) {
+          this.homeLearningStore.revision = Math.max(
+            this.homeLearningStore.revision,
+            Math.trunc(response.revision),
+          )
+        }
+        this.homeLearningLastRefresh = Date.now()
+        this.scheduleActiveAgentLearningRefresh()
+        void this.refreshHomeLearningMemory(true)
+      }
+
+      return JSON.stringify({
+        ok: true,
+        removed: Boolean(response.removed),
+        memory_id: memoryId,
+      })
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not forget durable memory', error)
+      return JSON.stringify({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 
   private async executeHomeLearningObserve(args: HomeLearningObserveArgs): Promise<string> {
@@ -1616,11 +1987,12 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
 
   private emptyLearningStore(): HomeLearningStore {
     return {
-      version: 1,
+      version: 2,
       revision: 0,
       thresholds: { ...DEFAULT_HOME_LEARNING_THRESHOLDS },
       aliases: [],
       preferences: [],
+      memories: [],
       updated_at: 0,
     }
   }
@@ -1753,6 +2125,56 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
     }
   }
 
+  private sanitizeDurableMemory(value: unknown): DurableMemory | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const item = value as Record<string, unknown>
+
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const content = typeof item.content === 'string' ? item.content.trim() : ''
+    const scope = item.scope
+    const category = item.category
+    const source = item.source
+    if (
+      !id ||
+      !content ||
+      (scope !== 'household' && scope !== 'user') ||
+      (category !== 'household_fact' &&
+        category !== 'user_preference' &&
+        category !== 'assistant_behavior') ||
+      (source !== 'explicit_user' && source !== 'system')
+    ) {
+      return null
+    }
+
+    const createdAt = this.safeTimestamp(item.created_at, Date.now())
+    const updatedAt = this.safeTimestamp(item.updated_at, createdAt)
+    const userId = this.safeNullableString(item.user_id)
+    if (scope === 'user' && !userId) return null
+
+    return {
+      id,
+      scope,
+      user_id: scope === 'user' ? userId : null,
+      category,
+      memory_key: this.safeNullableString(item.memory_key),
+      content,
+      normalized_content:
+        typeof item.normalized_content === 'string' && item.normalized_content.trim()
+          ? item.normalized_content.trim()
+          : this.normalizeHomeName(content),
+      confidence: Math.max(0, Math.min(0.99, this.safeFiniteNumber(item.confidence, 0.99))),
+      source,
+      priority: Math.max(0, Math.min(1, this.safeFiniteNumber(item.priority, 0.75))),
+      created_at: createdAt,
+      updated_at: updatedAt,
+      last_used_at:
+        item.last_used_at === null || item.last_used_at === undefined
+          ? null
+          : this.safeTimestamp(item.last_used_at, updatedAt),
+      use_count: this.safeNonNegativeInteger(item.use_count),
+    }
+  }
+
   private sanitizeLearningContext(value: unknown): HomeLearningStore {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return this.emptyLearningStore()
@@ -1774,9 +2196,14 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
           .map(value => this.sanitizeLearnedPreference(value))
           .filter((value): value is LearnedNumericPreference => value !== null)
       : []
+    const memories = Array.isArray(candidate.memories)
+      ? candidate.memories
+          .map(value => this.sanitizeDurableMemory(value))
+          .filter((value): value is DurableMemory => value !== null)
+      : []
 
     return {
-      version: 1,
+      version: 2,
       revision: this.safeNonNegativeInteger(candidate.revision),
       thresholds: {
         direct_alias_confidence: Math.max(
@@ -1812,6 +2239,7 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       },
       aliases,
       preferences,
+      memories,
       updated_at: this.safeNonNegativeInteger(candidate.updated_at),
     }
   }
@@ -1828,8 +2256,12 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
       )
       .sort()
       .join('|')
+    const memories = store.memories
+      .map(memory => `${memory.id}:${memory.updated_at}:${memory.content}`)
+      .sort()
+      .join('|')
 
-    return `${store.revision}::${aliases}::${preferences}`
+    return `${store.revision}::${aliases}::${preferences}::${memories}`
   }
 
   private upsertLearnedAlias(alias: LearnedEntityAlias): void {
@@ -1851,6 +2283,17 @@ ${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n
     this.homeLearningStore.updated_at = Math.max(
       this.homeLearningStore.updated_at,
       preference.updated_at,
+    )
+  }
+
+  private upsertDurableMemory(memory: DurableMemory): void {
+    const index = this.homeLearningStore.memories.findIndex(item => item.id === memory.id)
+    if (index >= 0) this.homeLearningStore.memories[index] = memory
+    else this.homeLearningStore.memories.push(memory)
+
+    this.homeLearningStore.updated_at = Math.max(
+      this.homeLearningStore.updated_at,
+      memory.updated_at,
     )
   }
 

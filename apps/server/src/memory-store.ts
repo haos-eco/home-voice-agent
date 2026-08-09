@@ -1,7 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 
 export type AliasEvidenceKind =
   | 'discovery'
@@ -21,6 +21,8 @@ export type MemoryThresholds = {
   minRetainedConfidence: number
   maxAliases: number
   maxPreferences: number
+  maxSemanticMemories: number
+  maxContextMemories: number
   maxEvents: number
 }
 
@@ -79,8 +81,58 @@ export type PreferenceObservation = {
   at?: number
 }
 
+export type SemanticMemoryScope = 'household' | 'user'
+export type SemanticMemoryCategory = 'household_fact' | 'user_preference' | 'assistant_behavior'
+export type SemanticMemorySource = 'explicit_user' | 'system'
+
+export type SemanticMemoryRow = {
+  id: string
+  scope: SemanticMemoryScope
+  user_id: string | null
+  category: SemanticMemoryCategory
+  memory_key: string | null
+  content: string
+  normalized_content: string
+  confidence: number
+  source: SemanticMemorySource
+  priority: number
+  created_at: number
+  updated_at: number
+  last_used_at: number | null
+  use_count: number
+  deleted_at: number | null
+}
+
+export type SemanticMemoryWrite = {
+  event_id?: string
+  scope: SemanticMemoryScope
+  user_id?: string | null
+  category: SemanticMemoryCategory
+  memory_key?: string | null
+  content: string
+  source?: SemanticMemorySource
+  source_device?: string | null
+  at?: number
+}
+
+export type SemanticMemoryRecall = {
+  query: string
+  user_id?: string | null | undefined
+  categories?: SemanticMemoryCategory[] | undefined
+  limit?: number | undefined
+  touch?: boolean | undefined
+}
+
+export type SemanticMemoryForget = {
+  event_id?: string
+  memory_id: string
+  user_id?: string | null
+  source_device?: string | null
+  at?: number
+}
+
 export type MemoryContext = {
-  version: 1
+  version: 2
   revision: number
   thresholds: {
     direct_alias_confidence: number
@@ -89,10 +141,11 @@ export type MemoryContext = {
   }
   aliases: AliasRow[]
   preferences: PreferenceRow[]
+  memories: SemanticMemoryRow[]
   updated_at: number
 }
 
-export const MEMORY_SCHEMA_VERSION = 1 as const
+export const MEMORY_SCHEMA_VERSION = 2 as const
 
 export const DEFAULT_THRESHOLDS: Readonly<MemoryThresholds> = Object.freeze({
   directAliasConfidence: 0.82,
@@ -102,6 +155,8 @@ export const DEFAULT_THRESHOLDS: Readonly<MemoryThresholds> = Object.freeze({
   minRetainedConfidence: 0.08,
   maxAliases: 250,
   maxPreferences: 120,
+  maxSemanticMemories: 500,
+  maxContextMemories: 12,
   maxEvents: 10_000,
 })
 
@@ -114,6 +169,13 @@ const ALIAS_EVIDENCE = new Set<AliasEvidenceKind>([
 ])
 const PREFERENCE_EVIDENCE = new Set<PreferenceEvidenceKind>(['implicit', 'explicit', 'correction'])
 const METRICS = new Set<PreferenceMetric>(['temperature', 'volume_level', 'brightness_pct'])
+const SEMANTIC_MEMORY_SCOPES = new Set<SemanticMemoryScope>(['household', 'user'])
+const SEMANTIC_MEMORY_CATEGORIES = new Set<SemanticMemoryCategory>([
+  'household_fact',
+  'user_preference',
+  'assistant_behavior',
+])
+const SEMANTIC_MEMORY_SOURCES = new Set<SemanticMemorySource>(['explicit_user', 'system'])
 
 type SqlRow = Record<string, unknown>
 
@@ -159,6 +221,87 @@ function aliasId(
 
 function preferenceId(metric: PreferenceMetric, areaName: string | null, entityId: string): string {
   return ['preference', metric, normalizeName(areaName || '*'), entityId].join('|')
+}
+
+function normalizeMemoryKey(value: unknown): string | null {
+  const normalized = normalizeName(value)
+  if (!normalized) return null
+  return normalized.replace(/\s+/g, '_').slice(0, 120)
+}
+
+function tokenize(value: unknown): string[] {
+  const normalized = normalizeName(value)
+  if (!normalized) return []
+  return [...new Set(normalized.split(' ').filter(token => token.length >= 2))]
+}
+
+function semanticMemoryPriority(category: SemanticMemoryCategory): number {
+  if (category === 'assistant_behavior') return 0.95
+  if (category === 'user_preference') return 0.85
+  return 0.75
+}
+
+function semanticMemoryId(input: {
+  scope: SemanticMemoryScope
+  userId: string | null
+  category: SemanticMemoryCategory
+  memoryKey: string | null
+  normalizedContent: string
+}): string {
+  const scopeOwner = input.scope === 'user' ? input.userId || 'missing-user' : '*'
+  const stablePart =
+    input.memoryKey ||
+    createHash('sha256').update(input.normalizedContent).digest('hex').slice(0, 24)
+  return ['memory', input.scope, scopeOwner, input.category, stablePart].join('|')
+}
+
+function semanticMemoryMatchesQuery(row: SemanticMemoryRow, query: string): boolean {
+  const normalizedQuery = normalizeName(query)
+  if (!normalizedQuery) return true
+  if (row.normalized_content.includes(normalizedQuery)) return true
+  if (normalizedQuery.includes(row.normalized_content) && row.normalized_content.length >= 4)
+    return true
+
+  const queryTokens = tokenize(normalizedQuery).filter(token => token.length >= 3)
+  if (queryTokens.length === 0) return false
+  const contentTokens = new Set(tokenize(row.normalized_content))
+  const keyTokens = new Set(tokenize(row.memory_key || ''))
+  return queryTokens.some(token => contentTokens.has(token) || keyTokens.has(token))
+}
+
+function semanticMemoryScore(row: SemanticMemoryRow, query: string): number {
+  const normalizedQuery = normalizeName(query)
+  const queryTokens = tokenize(normalizedQuery)
+  const contentTokens = new Set(tokenize(row.normalized_content))
+  const keyTokens = new Set(tokenize(row.memory_key || ''))
+
+  let score = row.priority * 4
+  if (row.scope === 'user') score += 0.35
+  if (row.category === 'assistant_behavior') score += normalizedQuery ? 0.2 : 1.5
+  if (row.category === 'user_preference') score += normalizedQuery ? 0.15 : 0.8
+
+  if (normalizedQuery) {
+    if (row.normalized_content === normalizedQuery) score += 10
+    else if (row.normalized_content.includes(normalizedQuery)) score += 7
+    else if (normalizedQuery.includes(row.normalized_content) && row.normalized_content.length >= 4)
+      score += 5
+
+    let contentMatches = 0
+    let keyMatches = 0
+    for (const token of queryTokens) {
+      if (contentTokens.has(token)) contentMatches += 1
+      if (keyTokens.has(token)) keyMatches += 1
+    }
+    if (queryTokens.length > 0) {
+      score += (contentMatches / queryTokens.length) * 5
+      score += (keyMatches / queryTokens.length) * 3
+    }
+  }
+
+  const ageDays = Math.max(0, Date.now() - row.updated_at) / 86_400_000
+  score += Math.max(0, 1 - ageDays / 365) * 0.35
+  score += Math.min(0.5, Math.log1p(Math.max(0, row.use_count)) * 0.08)
+  return score
 }
 
 function sameScope(
@@ -245,6 +388,11 @@ function asPreferenceRow(row: unknown): PreferenceRow | null {
   return row as PreferenceRow
 }
 
+function asSemanticMemoryRow(row: unknown): SemanticMemoryRow | null {
+  if (!row || typeof row !== 'object') return null
+  return row as SemanticMemoryRow
+}
+
 export class HomeVoiceMemoryStore {
   readonly path: string
   readonly thresholds: MemoryThresholds
@@ -317,6 +465,38 @@ export class HomeVoiceMemoryStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_learning_events_created ON learning_events(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL CHECK(scope IN ('household','user')),
+        user_id TEXT,
+        category TEXT NOT NULL CHECK(category IN ('household_fact','user_preference','assistant_behavior')),
+        memory_key TEXT,
+        content TEXT NOT NULL,
+        normalized_content TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 0.99),
+        source TEXT NOT NULL CHECK(source IN ('explicit_user','system')),
+        priority REAL NOT NULL CHECK(priority >= 0 AND priority <= 1),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        deleted_at INTEGER,
+        CHECK((scope = 'household' AND user_id IS NULL) OR (scope = 'user' AND user_id IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS idx_memories_visible ON memories(scope, user_id, category, deleted_at, priority DESC, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(scope, user_id, category, memory_key) WHERE memory_key IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS memory_events (
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        user_id TEXT,
+        source_device TEXT,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_events_created ON memory_events(created_at DESC);
     `)
 
     this.db
@@ -430,6 +610,91 @@ export class HomeVoiceMemoryStore {
     `,
       )
       .run(now, this.thresholds.maxPreferences)
+  }
+
+  private recordMemoryEvent(input: {
+    eventId?: string | undefined
+    eventType: string
+    subjectId: string
+    userId?: string | null | undefined
+    sourceDevice?: string | null | undefined
+    payload: unknown
+    createdAt: number
+  }): { eventId: string; inserted: boolean } {
+    const id = normalizeNullable(input.eventId) || randomUUID()
+    const result = this.db
+      .prepare(
+        `
+      INSERT OR IGNORE INTO memory_events(event_id, event_type, subject_id, user_id, source_device, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+      )
+      .run(
+        id,
+        input.eventType,
+        input.subjectId,
+        normalizeNullable(input.userId),
+        normalizeNullable(input.sourceDevice),
+        JSON.stringify(input.payload ?? {}),
+        input.createdAt,
+      )
+    return { eventId: id, inserted: Number(result.changes) === 1 }
+  }
+
+  private trimMemoryEvents(): void {
+    const max = Math.max(100, asInt(this.thresholds.maxEvents, DEFAULT_THRESHOLDS.maxEvents))
+    this.db
+      .prepare(
+        `
+      DELETE FROM memory_events WHERE event_id IN (
+        SELECT event_id FROM memory_events ORDER BY created_at DESC LIMIT -1 OFFSET ?
+      )
+    `,
+      )
+      .run(max)
+  }
+
+  private trimSemanticMemories(): void {
+    const max = Math.max(
+      20,
+      asInt(this.thresholds.maxSemanticMemories, DEFAULT_THRESHOLDS.maxSemanticMemories),
+    )
+    const now = Date.now()
+    this.db
+      .prepare(
+        `
+      UPDATE memories SET deleted_at = COALESCE(deleted_at, ?)
+      WHERE id IN (
+        SELECT id FROM memories WHERE deleted_at IS NULL
+        ORDER BY priority DESC, updated_at DESC LIMIT -1 OFFSET ?
+      )
+    `,
+      )
+      .run(now, max)
+  }
+
+  private visibleSemanticMemories(
+    userId: string | null,
+    categories?: SemanticMemoryCategory[],
+  ): SemanticMemoryRow[] {
+    const categoryList = Array.isArray(categories)
+      ? categories.filter(category => SEMANTIC_MEMORY_CATEGORIES.has(category))
+      : []
+    const categorySql =
+      categoryList.length > 0 ? ` AND category IN (${categoryList.map(() => '?').join(',')})` : ''
+    const args: SQLInputValue[] = [userId]
+    args.push(...categoryList)
+    return this.db
+      .prepare(
+        `
+      SELECT * FROM memories
+      WHERE deleted_at IS NULL
+        AND (scope = 'household' OR (scope = 'user' AND user_id = ?))
+        ${categorySql}
+      ORDER BY priority DESC, updated_at DESC
+    `,
+      )
+      .all(...args) as unknown as SemanticMemoryRow[]
   }
 
   observeAlias(input: AliasObservation): {
@@ -880,6 +1145,221 @@ export class HomeVoiceMemoryStore {
     })
   }
 
+  rememberMemory(input: SemanticMemoryWrite): {
+    ok: true
+    duplicate: boolean
+    event_id: string
+    revision: number
+    memory: SemanticMemoryRow | null
+  } {
+    if (!SEMANTIC_MEMORY_SCOPES.has(input.scope))
+      throw new Error(`Invalid memory scope: ${String(input.scope)}`)
+    if (!SEMANTIC_MEMORY_CATEGORIES.has(input.category))
+      throw new Error(`Invalid memory category: ${String(input.category)}`)
+
+    const content = normalizeNullable(input.content)
+    if (!content || content.length < 3) throw new Error('Memory content is required.')
+    if (content.length > 1200) throw new Error('Memory content is too long.')
+
+    const userId = normalizeNullable(input.user_id)
+    if (input.scope === 'user' && !userId)
+      throw new Error('A Home Assistant user id is required for user-scoped memory.')
+    const scopedUserId = input.scope === 'user' ? userId : null
+    const source = input.source ?? 'explicit_user'
+    if (!SEMANTIC_MEMORY_SOURCES.has(source))
+      throw new Error(`Invalid memory source: ${String(source)}`)
+
+    const normalizedContent = normalizeName(content)
+    if (!normalizedContent) throw new Error('Memory content is empty after normalization.')
+    const memoryKey = normalizeMemoryKey(input.memory_key)
+    const id = semanticMemoryId({
+      scope: input.scope,
+      userId: scopedUserId,
+      category: input.category,
+      memoryKey,
+      normalizedContent,
+    })
+    const at = Number.isFinite(input.at) ? Math.trunc(input.at as number) : Date.now()
+    const confidence = source === 'explicit_user' ? 0.99 : 0.95
+    const priority = semanticMemoryPriority(input.category)
+
+    return this.transaction(() => {
+      const recorded = this.recordMemoryEvent({
+        eventId: input.event_id,
+        eventType: 'memory:remember',
+        subjectId: id,
+        userId: scopedUserId,
+        sourceDevice: input.source_device,
+        payload: { scope: input.scope, category: input.category, memoryKey, content, source },
+        createdAt: at,
+      })
+      if (!recorded.inserted) {
+        return {
+          ok: true as const,
+          duplicate: true,
+          event_id: recorded.eventId,
+          revision: this.revision(),
+          memory: this.getSemanticMemoryById(id, userId),
+        }
+      }
+
+      this.db
+        .prepare(
+          `
+        INSERT INTO memories(
+          id, scope, user_id, category, memory_key, content, normalized_content,
+          confidence, source, priority, created_at, updated_at, last_used_at, use_count, deleted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)
+        ON CONFLICT(id) DO UPDATE SET
+          content=excluded.content,
+          normalized_content=excluded.normalized_content,
+          confidence=excluded.confidence,
+          source=excluded.source,
+          priority=excluded.priority,
+          updated_at=excluded.updated_at,
+          deleted_at=NULL
+      `,
+        )
+        .run(
+          id,
+          input.scope,
+          scopedUserId,
+          input.category,
+          memoryKey,
+          content,
+          normalizedContent,
+          confidence,
+          source,
+          priority,
+          at,
+          at,
+        )
+
+      this.trimSemanticMemories()
+      this.trimMemoryEvents()
+      const revision = this.bumpRevision()
+      return {
+        ok: true as const,
+        duplicate: false,
+        event_id: recorded.eventId,
+        revision,
+        memory: this.getSemanticMemoryById(id, userId),
+      }
+    })
+  }
+
+  forgetMemory(input: SemanticMemoryForget): {
+    ok: true
+    duplicate: boolean
+    event_id: string
+    revision: number
+    removed: boolean
+    memory_id: string
+  } {
+    const memoryId = normalizeNullable(input.memory_id)
+    if (!memoryId) throw new Error('memory_id is required.')
+    const userId = normalizeNullable(input.user_id)
+    const at = Number.isFinite(input.at) ? Math.trunc(input.at as number) : Date.now()
+    const current = this.getSemanticMemoryById(memoryId, userId)
+
+    return this.transaction(() => {
+      const recorded = this.recordMemoryEvent({
+        eventId: input.event_id,
+        eventType: 'memory:forget',
+        subjectId: memoryId,
+        userId,
+        sourceDevice: input.source_device,
+        payload: { memoryId },
+        createdAt: at,
+      })
+      if (!recorded.inserted) {
+        return {
+          ok: true as const,
+          duplicate: true,
+          event_id: recorded.eventId,
+          revision: this.revision(),
+          removed: false,
+          memory_id: memoryId,
+        }
+      }
+
+      if (!current) {
+        this.trimMemoryEvents()
+        return {
+          ok: true as const,
+          duplicate: false,
+          event_id: recorded.eventId,
+          revision: this.revision(),
+          removed: false,
+          memory_id: memoryId,
+        }
+      }
+
+      this.db
+        .prepare(`UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?`)
+        .run(at, at, memoryId)
+      this.trimMemoryEvents()
+      const revision = this.bumpRevision()
+      return {
+        ok: true as const,
+        duplicate: false,
+        event_id: recorded.eventId,
+        revision,
+        removed: true,
+        memory_id: memoryId,
+      }
+    })
+  }
+
+  recallMemories(input: SemanticMemoryRecall): {
+    ok: true
+    memories: SemanticMemoryRow[]
+  } {
+    const userId = normalizeNullable(input.user_id)
+    const query = normalizeNullable(input.query) || ''
+    const categories = Array.isArray(input.categories)
+      ? input.categories.filter(category => SEMANTIC_MEMORY_CATEGORIES.has(category))
+      : undefined
+    const limit = Math.max(1, Math.min(20, asInt(input.limit, this.thresholds.maxContextMemories)))
+    const rows = this.visibleSemanticMemories(userId, categories)
+    const memories = rows
+      .map(row => ({ row, score: semanticMemoryScore(row, query) }))
+      .filter(item => !query || semanticMemoryMatchesQuery(item.row, query))
+      .sort((left, right) => right.score - left.score || right.row.updated_at - left.row.updated_at)
+      .slice(0, limit)
+      .map(item => item.row)
+
+    if (input.touch !== false && memories.length > 0) {
+      const now = Date.now()
+      const statement = this.db.prepare(`
+        UPDATE memories SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?
+      `)
+      this.transaction(() => {
+        for (const memory of memories) statement.run(now, memory.id)
+      })
+      for (const memory of memories) {
+        memory.last_used_at = now
+        memory.use_count += 1
+      }
+    }
+
+    return { ok: true as const, memories }
+  }
+
+  getSemanticMemoryById(id: string, userId: string | null): SemanticMemoryRow | null {
+    return asSemanticMemoryRow(
+      this.db
+        .prepare(
+          `
+      SELECT * FROM memories
+      WHERE id = ? AND deleted_at IS NULL
+        AND (scope = 'household' OR (scope = 'user' AND user_id = ?))
+    `,
+        )
+        .get(id, normalizeNullable(userId)),
+    )
+  }
+
   getAliasById(id: string): AliasRow | null {
     return asAliasRow(
       this.db.prepare(`SELECT * FROM aliases WHERE id = ? AND deleted_at IS NULL`).get(id),
@@ -892,7 +1372,13 @@ export class HomeVoiceMemoryStore {
     )
   }
 
-  getContext(options: { includeLowConfidence?: boolean } = {}): MemoryContext {
+  getContext(
+    options: {
+      includeLowConfidence?: boolean
+      userId?: string | null
+      memoryLimit?: number
+    } = {},
+  ): MemoryContext {
     const includeLowConfidence = options.includeLowConfidence ?? true
     const aliasMin = includeLowConfidence
       ? this.thresholds.minRetainedConfidence
@@ -916,6 +1402,16 @@ export class HomeVoiceMemoryStore {
     `,
       )
       .all(preferenceMin, this.thresholds.maxPreferences) as unknown as PreferenceRow[]
+    const memoryLimit = Math.max(
+      1,
+      Math.min(20, asInt(options.memoryLimit, this.thresholds.maxContextMemories)),
+    )
+    const memories = this.recallMemories({
+      query: '',
+      user_id: options.userId,
+      limit: memoryLimit,
+      touch: false,
+    }).memories
 
     return {
       version: MEMORY_SCHEMA_VERSION,
@@ -927,10 +1423,12 @@ export class HomeVoiceMemoryStore {
       },
       aliases,
       preferences,
+      memories,
       updated_at: Math.max(
         0,
         ...aliases.map(row => Number(row.updated_at) || 0),
         ...preferences.map(row => Number(row.updated_at) || 0),
+        ...memories.map(row => Number(row.updated_at) || 0),
       ),
     }
   }
@@ -942,7 +1440,9 @@ export class HomeVoiceMemoryStore {
     database_path: string
     active_aliases: number
     active_preferences: number
+    active_memories: number
     learning_events: number
+    memory_events: number
     quick_check: string | null
   } {
     const activeAliases = this.db
@@ -951,7 +1451,12 @@ export class HomeVoiceMemoryStore {
     const activePreferences = this.db
       .prepare(`SELECT COUNT(*) AS n FROM preferences WHERE deleted_at IS NULL`)
       .get() as SqlRow | undefined
+    const activeMemories = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM memories WHERE deleted_at IS NULL`)
+      .get() as SqlRow | undefined
     const events = this.db.prepare(`SELECT COUNT(*) AS n FROM learning_events`).get() as
+      SqlRow | undefined
+    const memoryEvents = this.db.prepare(`SELECT COUNT(*) AS n FROM memory_events`).get() as
       SqlRow | undefined
     const dbCheck = this.db.prepare(`PRAGMA quick_check`).get() as SqlRow | undefined
     const quickCheck = typeof dbCheck?.quick_check === 'string' ? dbCheck.quick_check : null
@@ -962,7 +1467,9 @@ export class HomeVoiceMemoryStore {
       database_path: this.path,
       active_aliases: asInt(activeAliases?.n),
       active_preferences: asInt(activePreferences?.n),
+      active_memories: asInt(activeMemories?.n),
       learning_events: asInt(events?.n),
+      memory_events: asInt(memoryEvents?.n),
       quick_check: quickCheck,
     }
   }
@@ -975,4 +1482,8 @@ export const memoryInternalsForTests = {
   preferenceId,
   applyAliasEvidence,
   applyPreferenceEvidence,
+  normalizeMemoryKey,
+  semanticMemoryId,
+  semanticMemoryScore,
+  semanticMemoryMatchesQuery,
 }
