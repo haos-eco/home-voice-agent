@@ -57,6 +57,17 @@ type HomeFindEntitiesArgs = {
   limit: number
 }
 
+type HomeLearningObserveArgs = {
+  kind: 'entity_alias' | 'numeric_preference'
+  phrase: string | null
+  area: string | null
+  domain: string | null
+  entity: string | null
+  metric: 'temperature' | 'volume_level' | 'brightness_pct' | null
+  value: number | null
+  correction: boolean
+}
+
 type HomeEntityRegistryEntry = {
   entity_id: string
   area_id?: string | null
@@ -95,6 +106,53 @@ type HomeCatalogEntity = {
   sensitive: boolean
 }
 
+type LearnedEntityAlias = {
+  id: string
+  phrase: string
+  normalized_phrase: string
+  area_name: string | null
+  domain: string | null
+  entity_id: string
+  confidence: number
+  observations: number
+  successful_uses: number
+  contradictions: number
+  created_at: number
+  updated_at: number
+  last_used_at: number | null
+}
+
+type LearnedNumericPreference = {
+  id: string
+  metric: 'temperature' | 'volume_level' | 'brightness_pct'
+  area_name: string | null
+  entity_id: string
+  value: number
+  confidence: number
+  observations: number
+  created_at: number
+  updated_at: number
+  last_used_at: number | null
+}
+
+type HomeLearningStore = {
+  version: 1
+  aliases: LearnedEntityAlias[]
+  preferences: LearnedNumericPreference[]
+  updated_at: number
+}
+
+type FrontendUserDataResponse = {
+  value?: unknown
+}
+
+type RecentDiscoveryHint = {
+  query: string
+  area: string | null
+  domain: string | null
+  expiresAt: number
+}
+
 type HomeSensitiveAction =
   | 'open'
   | 'close'
@@ -126,6 +184,7 @@ type PendingSensitiveAction = {
   action: HomeSensitiveAction
   label: string
   area: string | null
+  learnedQuery: string
 }
 
 type HomeAreaEntry = {
@@ -194,6 +253,16 @@ const DEFAULT_CONFIG: VoiceAgentConfig = {
 
 const HOME_KNOWLEDGE_REFRESH_MS = 60_000
 const HOME_KNOWLEDGE_DEBOUNCE_MS = 750
+
+const HOME_LEARNING_STORAGE_KEY = 'home_voice_agent_learning_v1'
+const HOME_LEARNING_LOCAL_STORAGE_KEY = 'home_voice_agent_learning_v1_fallback'
+const HOME_LEARNING_REFRESH_MS = 15_000
+const HOME_LEARNING_SAVE_DEBOUNCE_MS = 600
+const HOME_LEARNING_DISCOVERY_HINT_MS = 60_000
+const HOME_LEARNING_MAX_ALIASES = 250
+const HOME_LEARNING_MAX_PREFERENCES = 120
+const HOME_LEARNING_DIRECT_CONFIDENCE = 0.82
+const HOME_LEARNING_BOOST_CONFIDENCE = 0.48
 
 const HOME_CONTROL_PARAMETERS = {
   type: 'object',
@@ -339,6 +408,54 @@ const HOME_FIND_ENTITIES_PARAMETERS = {
   required: ['query', 'area', 'domain', 'whole_home', 'limit'],
 } as const
 
+const HOME_LEARNING_OBSERVE_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    kind: {
+      type: 'string',
+      enum: ['entity_alias', 'numeric_preference'],
+      description:
+        'Use entity_alias when the user reveals what they call a device; use numeric_preference when they express a stable preferred temperature, volume, or brightness.',
+    },
+    phrase: {
+      type: ['string', 'null'],
+      description:
+        'Natural household alias, such as TV, abat-jour, clima, or cancello. Required for entity_alias, otherwise null.',
+    },
+    area: {
+      type: ['string', 'null'],
+      description: 'Explicit area if stated; otherwise null so the current tablet room is used.',
+    },
+    domain: {
+      type: ['string', 'null'],
+      description:
+        'Optional Home Assistant domain if known, for example media_player, light, climate.',
+    },
+    entity: {
+      type: ['string', 'null'],
+      description:
+        'Natural device/entity description used to resolve the real Home Assistant entity. It does not need to be an entity_id.',
+    },
+    metric: {
+      type: ['string', 'null'],
+      enum: ['temperature', 'volume_level', 'brightness_pct', null],
+      description: 'Numeric preference metric. Null for entity_alias.',
+    },
+    value: {
+      type: ['number', 'null'],
+      description:
+        'Numeric preference value. volume_level uses 0..1, brightness_pct uses 0..100. Null for entity_alias.',
+    },
+    correction: {
+      type: 'boolean',
+      description:
+        'True when the user is explicitly correcting a previous device meaning or preference; otherwise false.',
+    },
+  },
+  required: ['kind', 'phrase', 'area', 'domain', 'entity', 'metric', 'value', 'correction'],
+} as const
+
 const HOME_SENSITIVE_CONTROL_PARAMETERS = {
   type: 'object',
   additionalProperties: false,
@@ -448,6 +565,15 @@ Targeting rules are important:
 - If the user names a specific entity/device, target that entity rather than every entity in the room.
 - The user should NOT need to know exact Home Assistant entity names or entity IDs.
 - Understand ordinary household references such as "TV", "televisore", "lampada", "condizionatore", "speaker", or "termostato" from context.
+- A persistent learning layer silently learns the user's household vocabulary and repeated numeric preferences from successful interactions.
+- When calling discovery/control tools, preserve the user's natural device wording in query/entity when practical. Do not replace "TV" with an exact entity id unless necessary; the learning layer uses that natural wording as evidence.
+- Do not announce that you learned or updated confidence unless the user asks about memory/learning.
+- If the user casually reveals a stable household meaning or preference, silently call home_learning_observe even if they did not say "remember".
+- Examples: "per TV intendo quella Samsung", "questa la chiamo abat-jour", "di solito tengo la camera a 22 gradi", "preferisco il volume al 30%".
+- If the user corrects a previous interpretation, call home_learning_observe with correction=true so the old mapping loses confidence quickly.
+- Do NOT call the learning tool for jokes, hypothetical statements, one-off temporary values, or facts unrelated to operating the home.
+- Learned mappings are hints, not reality. Home Assistant's current catalog always wins if an entity is removed, renamed, moved, or no longer exposes the required capability.
+- Learning NEVER bypasses confirmation rules for gates, locks, doors, alarms, garage access, or other sensitive targets.
 - When a device reference is generic or you are not sure which entity it means, call home_find_entities first. Search the explicitly named room, otherwise the current tablet room first.
 - Prefer the single obvious candidate. Ask a short clarification only when multiple candidates remain genuinely plausible.
 - home_find_entities also returns Home Assistant actions available for the matched target. Use that to understand what the device can actually do instead of assuming capabilities.
@@ -464,7 +590,6 @@ Targeting rules are important:
 - Never infer confirmation from the original command, silence, background speech, or another person's voice. If the user says no, changes subject, or is ambiguous, do not execute the pending action.
 - Locking a lock or closing a gate/garage is still routed through the sensitive tool for consistency, even though it is usually safer than opening it.
 - For ordinary device commands, do not ask for confirmation unnecessarily.
-- Locks, alarms, gates, garage doors, security devices, and other sensitive physical-access actions are not available through the current tools. Do not claim to control them.
 
 When a command is clear, act immediately and answer with a short natural confirmation.
 
@@ -498,6 +623,18 @@ export class HomeVoiceAgentController {
   private homeKnowledgeConnection: HassConnectionLike | null = null
   private homeKnowledgeUnsubscribers: Array<() => Promise<void>> = []
 
+  private homeLearningStore: HomeLearningStore = {
+    version: 1,
+    aliases: [],
+    preferences: [],
+    updated_at: 0,
+  }
+  private homeLearningLoaded = false
+  private homeLearningLastRefresh = 0
+  private homeLearningSaveTimer: number | null = null
+  private homeLearningStorageMode: 'home_assistant' | 'local_fallback' | 'unknown' = 'unknown'
+  private recentDiscoveryHints = new Map<string, RecentDiscoveryHint>()
+
   private audioContext: AudioContext | null = null
   private audioSource: MediaStreamAudioSourceNode | null = null
   private audioGain: GainNode | null = null
@@ -521,6 +658,7 @@ export class HomeVoiceAgentController {
       this.hassInitiallyBound = true
       void this.publishState()
       void this.refreshHomeKnowledge('initial bind')
+      void this.refreshHomeLearningMemory(true)
       this.startHomeKnowledgeRefreshTimer()
     } else {
       this.syncHomeKnowledgeStatesFromHass()
@@ -560,6 +698,8 @@ export class HomeVoiceAgentController {
       if (!options.inputReady && this.prepareInputHook) {
         await this.prepareInputHook()
       }
+
+      await this.refreshHomeLearningMemory(false)
 
       const credential = await this.requestClientCredential()
 
@@ -712,6 +852,13 @@ export class HomeVoiceAgentController {
       homeKnowledgeVersion: this.homeKnowledgeVersion,
       homeKnowledgeLastRefresh: this.homeKnowledgeLastRefresh || null,
       homeKnowledgeSubscriptions: this.homeKnowledgeUnsubscribers.length,
+      learnedAliases: this.homeLearningStore.aliases.length,
+      learnedHighConfidenceAliases: this.homeLearningStore.aliases.filter(
+        alias => alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE,
+      ).length,
+      learnedPreferences: this.homeLearningStore.preferences.length,
+      learningStorage: this.homeLearningStorageMode,
+      learningLastRefresh: this.homeLearningLastRefresh || null,
       sensitiveActionPending: Boolean(this.pendingSensitiveAction),
     }
   }
@@ -719,6 +866,7 @@ export class HomeVoiceAgentController {
   private buildAgentInstructions(areas: HomeAreaEntry[]): string {
     const areaNames = areas.map(area => area.name).filter(Boolean)
     const room = this.config.room || 'unknown'
+    const learnedContext = this.buildLearnedContextSummary()
 
     return `${AGENT_INSTRUCTIONS}
 
@@ -727,7 +875,40 @@ export class HomeVoiceAgentController {
 - This voice endpoint/tablet is configured for room: ${room}.
 - Home Assistant areas currently available: ${areaNames.length > 0 ? areaNames.join(', ') : 'not available'}.
 - The live Home Assistant knowledge layer currently knows ${this.homeCatalogCache.length} entities and is refreshed automatically when Home Assistant changes.
-- Remember: the current endpoint room is only a fallback. Any room explicitly named by the user takes priority.`
+- Remember: the current endpoint room is only a fallback. Any room explicitly named by the user takes priority.
+${learnedContext}`
+  }
+
+  private buildLearnedContextSummary(): string {
+    const aliases = this.homeLearningStore.aliases
+      .filter(alias => alias.confidence >= 0.72)
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, 24)
+      .map(alias => {
+        const area = alias.area_name ? ` in ${alias.area_name}` : ''
+        return `- "${alias.phrase}"${area} -> ${alias.entity_id} (confidence ${alias.confidence.toFixed(2)})`
+      })
+
+    const preferences = this.homeLearningStore.preferences
+      .filter(preference => preference.confidence >= 0.72)
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, 16)
+      .map(preference => {
+        const area = preference.area_name ? ` in ${preference.area_name}` : ''
+        return `- ${preference.metric}${area} for ${preference.entity_id}: ${Number(preference.value.toFixed(3))} (confidence ${preference.confidence.toFixed(2)})`
+      })
+
+    if (aliases.length === 0 && preferences.length === 0) {
+      return '- No high-confidence learned household mappings are available yet.'
+    }
+
+    return `# Learned household context
+
+These are persistent learned hints from repeated successful use. They never override current Home Assistant reality or sensitive-action confirmation.
+
+${aliases.length > 0 ? `Learned aliases:\n${aliases.join('\n')}` : 'Learned aliases: none yet.'}
+
+${preferences.length > 0 ? `Learned numeric preferences:\n${preferences.join('\n')}` : 'Learned numeric preferences: none yet.'}`
   }
 
   private createHomeAssistantTools() {
@@ -758,6 +939,15 @@ export class HomeVoiceAgentController {
       execute: async input => this.executeHomeFindEntities(input as HomeFindEntitiesArgs),
     })
 
+    const learningObserve = tool({
+      name: 'home_learning_observe',
+      description:
+        'Silently record a stable household alias/correction or numeric home preference revealed by the user. Use without announcing it. Resolve the real Home Assistant entity first; learning never changes sensitive-action confirmation rules.',
+      parameters: HOME_LEARNING_OBSERVE_PARAMETERS as any,
+      strict: true,
+      execute: async input => this.executeHomeLearningObserve(input as HomeLearningObserveArgs),
+    })
+
     const sensitiveControl = tool({
       name: 'home_sensitive_control',
       description:
@@ -784,7 +974,164 @@ export class HomeVoiceAgentController {
       },
     })
 
-    return [findEntities, control, sensitiveControl, status, listAreas]
+    return [findEntities, control, learningObserve, sensitiveControl, status, listAreas]
+  }
+
+  private async executeHomeLearningObserve(args: HomeLearningObserveArgs): Promise<string> {
+    if (!this.hass) {
+      return JSON.stringify({
+        ok: false,
+        error: 'Home Assistant is not connected.',
+      })
+    }
+
+    try {
+      await this.refreshHomeLearningMemory(false)
+
+      const areaName = args.area || this.config.room || null
+
+      if (args.kind === 'entity_alias') {
+        if (!args.phrase || !args.entity) {
+          return JSON.stringify({
+            ok: false,
+            error: 'entity_alias requires phrase and entity.',
+          })
+        }
+
+        const entityIds = await this.resolveHomeTargets({
+          domain: args.domain || undefined,
+          area: args.area,
+          entity: args.entity,
+          wholeHome: false,
+        })
+
+        const entity = entityIds[0]
+
+        if (entityIds.length !== 1 || !entity) {
+          return JSON.stringify({
+            ok: false,
+            error: 'The alias target must resolve to exactly one Home Assistant entity.',
+            targets: entityIds,
+          })
+        }
+
+        const catalog = await this.getHomeCatalog()
+        const target = catalog.find(({ entity_id }) => entity_id === entity)
+
+        await this.observeLearnedAlias({
+          phrase: args.phrase,
+          areaName: args.area || target?.area_name || areaName,
+          domain: args.domain || target?.domain || null,
+          entityId: entity,
+          evidence: args.correction ? 'explicit_correction' : 'explicit_learning',
+        })
+
+        return JSON.stringify({
+          ok: true,
+          learned: 'entity_alias',
+          phrase: args.phrase,
+          target: entity,
+          area: args.area || target?.area_name || areaName,
+          correction: args.correction,
+        })
+      }
+
+      if (!args.metric || args.value === null || !Number.isFinite(args.value) || !args.entity) {
+        return JSON.stringify({
+          ok: false,
+          error: 'numeric_preference requires metric, value, and a resolvable entity.',
+        })
+      }
+
+      const entityIds = await this.resolveHomeTargets({
+        domain: args.domain || undefined,
+        area: args.area,
+        entity: args.entity,
+        wholeHome: false,
+      })
+
+      const entity = entityIds[0]
+
+      if (entityIds.length !== 1 || !entity) {
+        return JSON.stringify({
+          ok: false,
+          error: 'The numeric preference target must resolve to exactly one Home Assistant entity.',
+          targets: entityIds,
+        })
+      }
+
+      const catalog = await this.getHomeCatalog()
+      const target = catalog.find(({ entity_id }) => entity_id === entity)
+
+      if (args.correction) {
+        const preferenceId = this.learningPreferenceId(
+          args.metric,
+          args.area || target?.area_name || areaName,
+          entity,
+        )
+        const existing = this.homeLearningStore.preferences.find(item => item.id === preferenceId)
+
+        if (existing) {
+          existing.value = args.value
+          existing.confidence = 0.88
+          existing.observations += 1
+          existing.updated_at = Date.now()
+          existing.last_used_at = Date.now()
+          this.scheduleLearningSave()
+
+          return JSON.stringify({
+            ok: true,
+            learned: 'numeric_preference',
+            metric: args.metric,
+            value: args.value,
+            target: entity,
+            area: args.area || target?.area_name || areaName,
+            correction: true,
+          })
+        }
+      }
+
+      await this.observeNumericPreference({
+        metric: args.metric,
+        value: args.value,
+        areaName: args.area || target?.area_name || areaName,
+        entityId: entity,
+      })
+
+      // A preference explicitly stated by the user deserves more confidence
+      // than a value inferred from a one-off control command.
+      const preferenceId = this.learningPreferenceId(
+        args.metric,
+        args.area || target?.area_name || areaName,
+        entity,
+      )
+      const preference = this.homeLearningStore.preferences.find(item => item.id === preferenceId)
+
+      if (preference) {
+        preference.confidence = Math.max(preference.confidence, args.correction ? 0.88 : 0.76)
+        preference.updated_at = Date.now()
+        this.scheduleLearningSave()
+      }
+
+      return JSON.stringify({
+        ok: true,
+        learned: 'numeric_preference',
+        metric: args.metric,
+        value: args.value,
+        target: entity,
+        area: args.area || target?.area_name || areaName,
+        correction: args.correction,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+
+      console.warn('[Home Voice Agent] Silent learning observation failed', error)
+
+      return JSON.stringify({
+        ok: false,
+        error: message,
+      })
+    }
   }
 
   private async executeHomeFindEntities(args: HomeFindEntitiesArgs): Promise<string> {
@@ -794,6 +1141,8 @@ export class HomeVoiceAgentController {
 
     try {
       const limit = Math.max(1, Math.min(12, Math.trunc(args.limit || 5)))
+      await this.refreshHomeLearningMemory(false)
+
       const result = await this.findHomeEntities({
         query: args.query,
         area: args.area,
@@ -801,6 +1150,35 @@ export class HomeVoiceAgentController {
         wholeHome: args.whole_home,
         limit,
       })
+
+      const hintArea = args.area || (!args.whole_home ? this.config.room || null : null)
+
+      for (const entity of result.entities) {
+        this.recentDiscoveryHints.set(entity.entity_id, {
+          query: args.query,
+          area: hintArea,
+          domain: args.domain,
+          expiresAt: Date.now() + HOME_LEARNING_DISCOVERY_HINT_MS,
+        })
+      }
+
+      if (result.entities.length > 0) {
+        const first = result.entities[0]
+        if (!first) {
+          return JSON.stringify({
+            ok: false,
+            error: 'No matching Home Assistant entity found.',
+          })
+        }
+
+        void this.observeLearnedAlias({
+          phrase: args.query,
+          areaName: hintArea,
+          domain: args.domain || first.domain,
+          entityId: first.entity_id,
+          evidence: 'discovery',
+        })
+      }
 
       return JSON.stringify({
         ok: true,
@@ -814,9 +1192,7 @@ export class HomeVoiceAgentController {
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-
       console.warn('[Home Voice Agent] Home Assistant discovery failed', error)
-
       return JSON.stringify({ ok: false, error: message })
     }
   }
@@ -828,6 +1204,8 @@ export class HomeVoiceAgentController {
     wholeHome: boolean
     limit: number
   }): Promise<{ entities: HomeCatalogEntity[]; actions: string[] }> {
+    await this.refreshHomeLearningMemory(false)
+
     const catalog = await this.getHomeCatalog()
     let scoped = catalog
 
@@ -920,7 +1298,515 @@ export class HomeVoiceAgentController {
       }
     }
 
+    if (best < 300) {
+      best += this.learnedAliasScoreBoost(query, entity)
+    }
+
     return best
+  }
+
+  private learnedAliasScoreBoost(query: string, entity: HomeCatalogEntity): number {
+    if (!query || !this.homeLearningLoaded) return 0
+
+    let bestBoost = 0
+
+    for (const alias of this.homeLearningStore.aliases) {
+      if (
+        alias.entity_id !== entity.entity_id ||
+        alias.normalized_phrase !== query ||
+        alias.confidence < HOME_LEARNING_BOOST_CONFIDENCE
+      ) {
+        continue
+      }
+
+      if (alias.domain && alias.domain !== entity.domain) {
+        continue
+      }
+
+      if (
+        alias.area_name &&
+        entity.area_name &&
+        this.normalizeHomeName(alias.area_name) !== this.normalizeHomeName(entity.area_name)
+      ) {
+        continue
+      }
+
+      const boost =
+        alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE
+          ? 250 * alias.confidence
+          : 130 * alias.confidence
+
+      bestBoost = Math.max(bestBoost, Math.round(boost))
+    }
+
+    return bestBoost
+  }
+
+  private emptyLearningStore(): HomeLearningStore {
+    return {
+      version: 1,
+      aliases: [],
+      preferences: [],
+      updated_at: 0,
+    }
+  }
+
+  private sanitizeLearningStore(value: unknown): HomeLearningStore {
+    if (!value || typeof value !== 'object') {
+      return this.emptyLearningStore()
+    }
+
+    const candidate = value as Partial<HomeLearningStore>
+    const aliases = Array.isArray(candidate.aliases)
+      ? (candidate.aliases.filter(alias => {
+          if (!alias || typeof alias !== 'object') return false
+          const item = alias as Partial<LearnedEntityAlias>
+          return (
+            typeof item.id === 'string' &&
+            typeof item.phrase === 'string' &&
+            typeof item.normalized_phrase === 'string' &&
+            typeof item.entity_id === 'string' &&
+            typeof item.confidence === 'number'
+          )
+        }) as LearnedEntityAlias[])
+      : []
+
+    const preferences = Array.isArray(candidate.preferences)
+      ? (candidate.preferences.filter(preference => {
+          if (!preference || typeof preference !== 'object') return false
+          const item = preference as Partial<LearnedNumericPreference>
+          return (
+            typeof item.id === 'string' &&
+            typeof item.entity_id === 'string' &&
+            typeof item.metric === 'string' &&
+            typeof item.value === 'number' &&
+            typeof item.confidence === 'number'
+          )
+        }) as LearnedNumericPreference[])
+      : []
+
+    return {
+      version: 1,
+      aliases: aliases
+        .map(alias => ({
+          ...alias,
+          confidence: this.clampConfidence(alias.confidence),
+        }))
+        .slice(0, HOME_LEARNING_MAX_ALIASES),
+      preferences: preferences
+        .map(preference => ({
+          ...preference,
+          confidence: this.clampConfidence(preference.confidence),
+        }))
+        .slice(0, HOME_LEARNING_MAX_PREFERENCES),
+      updated_at: typeof candidate.updated_at === 'number' ? candidate.updated_at : 0,
+    }
+  }
+
+  private async refreshHomeLearningMemory(force: boolean): Promise<void> {
+    if (!this.hass) return
+
+    if (
+      !force &&
+      this.homeLearningLoaded &&
+      Date.now() - this.homeLearningLastRefresh < HOME_LEARNING_REFRESH_MS
+    ) {
+      return
+    }
+
+    try {
+      const response = await this.hass.callWS<FrontendUserDataResponse>({
+        type: 'frontend/get_user_data',
+        key: HOME_LEARNING_STORAGE_KEY,
+      })
+
+      const remote = this.sanitizeLearningStore(response?.value)
+      this.homeLearningStore = this.mergeLearningStores(this.homeLearningStore, remote)
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.homeLearningStorageMode = 'home_assistant'
+
+      this.writeLearningFallback()
+    } catch (error) {
+      const fallback = this.readLearningFallback()
+      this.homeLearningStore = this.mergeLearningStores(this.homeLearningStore, fallback)
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.homeLearningStorageMode = 'local_fallback'
+
+      console.warn(
+        '[Home Voice Agent] HA user-data memory unavailable; using local fallback',
+        error,
+      )
+    }
+  }
+
+  private readLearningFallback(): HomeLearningStore {
+    try {
+      const raw = window.localStorage.getItem(HOME_LEARNING_LOCAL_STORAGE_KEY)
+
+      if (!raw) return this.emptyLearningStore()
+
+      return this.sanitizeLearningStore(JSON.parse(raw))
+    } catch {
+      return this.emptyLearningStore()
+    }
+  }
+
+  private writeLearningFallback(): void {
+    try {
+      window.localStorage.setItem(
+        HOME_LEARNING_LOCAL_STORAGE_KEY,
+        JSON.stringify(this.homeLearningStore),
+      )
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not write local learning fallback', error)
+    }
+  }
+
+  private mergeLearningStores(
+    left: HomeLearningStore,
+    right: HomeLearningStore,
+  ): HomeLearningStore {
+    const aliases = new Map<string, LearnedEntityAlias>()
+    const preferences = new Map<string, LearnedNumericPreference>()
+
+    for (const alias of [...left.aliases, ...right.aliases]) {
+      const current = aliases.get(alias.id)
+      if (!current || alias.updated_at >= current.updated_at) {
+        aliases.set(alias.id, { ...alias })
+      }
+    }
+
+    for (const preference of [...left.preferences, ...right.preferences]) {
+      const current = preferences.get(preference.id)
+      if (!current || preference.updated_at >= current.updated_at) {
+        preferences.set(preference.id, { ...preference })
+      }
+    }
+
+    const aliasValues = [...aliases.values()]
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, HOME_LEARNING_MAX_ALIASES)
+
+    const preferenceValues = [...preferences.values()]
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, HOME_LEARNING_MAX_PREFERENCES)
+
+    return {
+      version: 1,
+      aliases: aliasValues,
+      preferences: preferenceValues,
+      updated_at: Math.max(left.updated_at, right.updated_at),
+    }
+  }
+
+  private scheduleLearningSave(): void {
+    this.writeLearningFallback()
+
+    if (this.homeLearningSaveTimer !== null) {
+      window.clearTimeout(this.homeLearningSaveTimer)
+    }
+
+    this.homeLearningSaveTimer = window.setTimeout(() => {
+      this.homeLearningSaveTimer = null
+      void this.persistLearningMemory()
+    }, HOME_LEARNING_SAVE_DEBOUNCE_MS)
+  }
+
+  private async persistLearningMemory(): Promise<void> {
+    if (!this.hass) return
+
+    this.homeLearningStore.updated_at = Date.now()
+    this.writeLearningFallback()
+
+    try {
+      // Re-read first so multiple tablets using the same HA user mostly merge
+      // observations instead of blindly overwriting one another.
+      let remote = this.emptyLearningStore()
+
+      try {
+        const response = await this.hass.callWS<FrontendUserDataResponse>({
+          type: 'frontend/get_user_data',
+          key: HOME_LEARNING_STORAGE_KEY,
+        })
+        remote = this.sanitizeLearningStore(response?.value)
+      } catch {
+        // The write below will decide whether HA user-data storage is available.
+      }
+
+      const merged = this.mergeLearningStores(remote, this.homeLearningStore)
+      merged.updated_at = Date.now()
+
+      await this.hass.callWS({
+        type: 'frontend/set_user_data',
+        key: HOME_LEARNING_STORAGE_KEY,
+        value: merged,
+      })
+
+      this.homeLearningStore = merged
+      this.homeLearningLoaded = true
+      this.homeLearningLastRefresh = Date.now()
+      this.homeLearningStorageMode = 'home_assistant'
+      this.writeLearningFallback()
+    } catch (error) {
+      this.homeLearningStorageMode = 'local_fallback'
+      console.warn('[Home Voice Agent] Could not persist learning memory in Home Assistant', error)
+    }
+  }
+
+  private async observeLearnedAlias(options: {
+    phrase: string
+    areaName: string | null
+    domain: string | null
+    entityId: string
+    evidence:
+      | 'discovery'
+      | 'successful_status'
+      | 'successful_action'
+      | 'explicit_learning'
+      | 'explicit_correction'
+  }): Promise<void> {
+    const phrase = options.phrase.trim()
+    const normalized = this.normalizeHomeName(phrase)
+
+    if (!normalized || normalized.length < 2) return
+
+    await this.refreshHomeLearningMemory(false)
+
+    const areaName = options.areaName?.trim() || null
+    const id = this.learningAliasId(normalized, areaName, options.domain, options.entityId)
+    const now = Date.now()
+
+    // Competing mappings for the same phrase/scope lose confidence when a
+    // different target is actually used successfully.
+    if (
+      options.evidence === 'successful_action' ||
+      options.evidence === 'explicit_learning' ||
+      options.evidence === 'explicit_correction'
+    ) {
+      for (const alias of this.homeLearningStore.aliases) {
+        if (
+          alias.id !== id &&
+          alias.normalized_phrase === normalized &&
+          this.sameLearningScope(alias.area_name, areaName, alias.domain, options.domain) &&
+          alias.entity_id !== options.entityId
+        ) {
+          alias.contradictions += 1
+          alias.confidence = this.clampConfidence(
+            alias.confidence * (options.evidence === 'explicit_correction' ? 0.25 : 0.55),
+          )
+          alias.updated_at = now
+        }
+      }
+    }
+
+    let alias = this.homeLearningStore.aliases.find(item => item.id === id)
+
+    if (!alias) {
+      const initialConfidence =
+        options.evidence === 'explicit_correction'
+          ? 0.9
+          : options.evidence === 'explicit_learning'
+            ? 0.82
+            : options.evidence === 'successful_action'
+              ? 0.62
+              : options.evidence === 'successful_status'
+                ? 0.5
+                : 0.34
+
+      alias = {
+        id,
+        phrase,
+        normalized_phrase: normalized,
+        area_name: areaName,
+        domain: options.domain,
+        entity_id: options.entityId,
+        confidence: initialConfidence,
+        observations: 0,
+        successful_uses: 0,
+        contradictions: 0,
+        created_at: now,
+        updated_at: now,
+        last_used_at: null,
+      }
+
+      this.homeLearningStore.aliases.push(alias)
+    }
+
+    alias.phrase = phrase
+    alias.observations += 1
+    alias.updated_at = now
+
+    if (options.evidence === 'explicit_correction' || options.evidence === 'explicit_learning') {
+      alias.successful_uses += 1
+      alias.last_used_at = now
+      alias.confidence = Math.max(
+        options.evidence === 'explicit_correction' ? 0.92 : 0.84,
+        this.clampConfidence(alias.confidence + (1 - alias.confidence) * 0.3),
+      )
+    } else if (options.evidence === 'successful_action') {
+      alias.successful_uses += 1
+      alias.last_used_at = now
+      alias.confidence = this.clampConfidence(alias.confidence + (1 - alias.confidence) * 0.18)
+    } else if (options.evidence === 'successful_status') {
+      alias.last_used_at = now
+      alias.confidence = Math.min(
+        0.78,
+        this.clampConfidence(alias.confidence + (1 - alias.confidence) * 0.1),
+      )
+    } else {
+      // Discovery alone may gather evidence, but it can never become
+      // authoritative without a real successful use.
+      alias.confidence = Math.min(
+        0.68,
+        this.clampConfidence(alias.confidence + (1 - alias.confidence) * 0.06),
+      )
+    }
+
+    this.trimLearningMemory()
+    this.scheduleLearningSave()
+  }
+
+  private async observeNumericPreference(options: {
+    metric: LearnedNumericPreference['metric']
+    value: number
+    areaName: string | null
+    entityId: string
+  }): Promise<void> {
+    if (!Number.isFinite(options.value)) return
+
+    await this.refreshHomeLearningMemory(false)
+
+    const areaName = options.areaName?.trim() || null
+    const id = this.learningPreferenceId(options.metric, areaName, options.entityId)
+    const now = Date.now()
+    let preference = this.homeLearningStore.preferences.find(item => item.id === id)
+
+    if (!preference) {
+      preference = {
+        id,
+        metric: options.metric,
+        area_name: areaName,
+        entity_id: options.entityId,
+        value: options.value,
+        confidence: 0.35,
+        observations: 1,
+        created_at: now,
+        updated_at: now,
+        last_used_at: now,
+      }
+
+      this.homeLearningStore.preferences.push(preference)
+      this.trimLearningMemory()
+      this.scheduleLearningSave()
+      return
+    }
+
+    const tolerance =
+      options.metric === 'temperature' ? 1.0 : options.metric === 'brightness_pct' ? 12 : 0.12
+    const distance = Math.abs(options.value - preference.value)
+    const consistent = distance <= tolerance
+
+    preference.observations += 1
+    preference.updated_at = now
+    preference.last_used_at = now
+
+    if (consistent) {
+      preference.value = preference.value * 0.72 + options.value * 0.28
+      preference.confidence = this.clampConfidence(
+        preference.confidence + (1 - preference.confidence) * 0.16,
+      )
+    } else {
+      // A changed preference is not treated as an error. Move toward the new
+      // value, but reduce confidence until repeated usage establishes a pattern.
+      preference.value = preference.value * 0.45 + options.value * 0.55
+      preference.confidence = this.clampConfidence(Math.max(0.24, preference.confidence * 0.72))
+    }
+
+    this.trimLearningMemory()
+    this.scheduleLearningSave()
+  }
+
+  private learningAliasId(
+    normalizedPhrase: string,
+    areaName: string | null,
+    domain: string | null,
+    entityId: string,
+  ): string {
+    return [
+      'alias',
+      normalizedPhrase,
+      this.normalizeHomeName(areaName || '*'),
+      domain || '*',
+      entityId,
+    ].join('|')
+  }
+
+  private learningPreferenceId(
+    metric: LearnedNumericPreference['metric'],
+    areaName: string | null,
+    entityId: string,
+  ): string {
+    return ['preference', metric, this.normalizeHomeName(areaName || '*'), entityId].join('|')
+  }
+
+  private sameLearningScope(
+    leftArea: string | null,
+    rightArea: string | null,
+    leftDomain: string | null,
+    rightDomain: string | null,
+  ): boolean {
+    return (
+      this.normalizeHomeName(leftArea || '*') === this.normalizeHomeName(rightArea || '*') &&
+      (leftDomain || '*') === (rightDomain || '*')
+    )
+  }
+
+  private clampConfidence(value: number): number {
+    return Math.max(0, Math.min(0.99, value))
+  }
+
+  private trimLearningMemory(): void {
+    this.homeLearningStore.aliases = this.homeLearningStore.aliases
+      .filter(alias => alias.confidence >= 0.08)
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, HOME_LEARNING_MAX_ALIASES)
+
+    this.homeLearningStore.preferences = this.homeLearningStore.preferences
+      .filter(preference => preference.confidence >= 0.08)
+      .sort((a, b) => b.confidence - a.confidence || b.updated_at - a.updated_at)
+      .slice(0, HOME_LEARNING_MAX_PREFERENCES)
+  }
+
+  private async reconcileLearningMemoryWithCatalog(catalog: HomeCatalogEntity[]): Promise<void> {
+    if (!this.homeLearningLoaded) {
+      await this.refreshHomeLearningMemory(false)
+    }
+
+    if (!this.homeLearningLoaded) return
+
+    const entityIds = new Set(catalog.map(entity => entity.entity_id))
+    const aliasesBefore = this.homeLearningStore.aliases.length
+    const preferencesBefore = this.homeLearningStore.preferences.length
+
+    this.homeLearningStore.aliases = this.homeLearningStore.aliases.filter(alias =>
+      entityIds.has(alias.entity_id),
+    )
+    this.homeLearningStore.preferences = this.homeLearningStore.preferences.filter(preference =>
+      entityIds.has(preference.entity_id),
+    )
+
+    if (
+      aliasesBefore !== this.homeLearningStore.aliases.length ||
+      preferencesBefore !== this.homeLearningStore.preferences.length
+    ) {
+      console.info('[Home Voice Agent] Removed stale learned home references', {
+        aliases: aliasesBefore - this.homeLearningStore.aliases.length,
+        preferences: preferencesBefore - this.homeLearningStore.preferences.length,
+      })
+      this.scheduleLearningSave()
+    }
   }
 
   private async getHomeCatalog(): Promise<HomeCatalogEntity[]> {
@@ -952,6 +1838,8 @@ export class HomeVoiceAgentController {
         this.homeCatalogCache = catalog
         this.homeKnowledgeLastRefresh = Date.now()
         this.homeKnowledgeVersion += 1
+
+        await this.reconcileLearningMemoryWithCatalog(catalog)
 
         console.info('[Home Voice Agent] Home knowledge refreshed', {
           reason,
@@ -1264,6 +2152,18 @@ export class HomeVoiceAgentController {
           },
         })
 
+        const pendingEntityId = pending.entityIds[0]
+
+        if (pending.entityIds.length === 1 && pendingEntityId && pending.learnedQuery) {
+          await this.observeLearnedAlias({
+            phrase: pending.learnedQuery,
+            areaName: pending.area,
+            domain: pending.domain,
+            entityId: pendingEntityId,
+            evidence: 'successful_action',
+          })
+        }
+
         this.pendingSensitiveAction = null
 
         console.info('[Home Voice Agent] Sensitive Home Assistant action executed', {
@@ -1317,6 +2217,7 @@ export class HomeVoiceAgentController {
         action: args.action,
         label: target.friendly_name,
         area: target.area_name,
+        learnedQuery: args.query,
       }
 
       return JSON.stringify({
@@ -1349,6 +2250,8 @@ export class HomeVoiceAgentController {
     query: string,
     area: string | null,
   ): Promise<HomeCatalogEntity> {
+    await this.refreshHomeLearningMemory(false)
+
     const catalog = await this.getHomeCatalog()
     const controllableDomains = new Set([
       'lock',
@@ -1546,6 +2449,8 @@ export class HomeVoiceAgentController {
         wholeHome: args.whole_home,
       })
 
+      const entityId = entityIds[0]
+
       if (entityIds.length === 0) {
         return JSON.stringify({
           ok: false,
@@ -1618,6 +2523,69 @@ export class HomeVoiceAgentController {
         entityIds,
       })
 
+      if (entityIds.length === 1 && entityId) {
+        const target = byId.get(entityId)
+        const learnedArea =
+          args.area || target?.area_name || (!args.whole_home ? this.config.room || null : null)
+
+        if (args.entity) {
+          await this.observeLearnedAlias({
+            phrase: args.entity,
+            areaName: learnedArea,
+            domain: args.domain,
+            entityId,
+            evidence: 'successful_action',
+          })
+        }
+
+        const discoveryHint = this.recentDiscoveryHints.get(entityId)
+        if (discoveryHint && discoveryHint.expiresAt >= Date.now()) {
+          await this.observeLearnedAlias({
+            phrase: discoveryHint.query,
+            areaName: discoveryHint.area || learnedArea,
+            domain: discoveryHint.domain || args.domain,
+            entityId,
+            evidence: 'successful_action',
+          })
+          this.recentDiscoveryHints.delete(entityId)
+        }
+
+        if (
+          args.domain === 'climate' &&
+          args.action === 'set_temperature' &&
+          args.temperature !== null
+        ) {
+          await this.observeNumericPreference({
+            metric: 'temperature',
+            value: args.temperature,
+            areaName: learnedArea,
+            entityId,
+          })
+        }
+
+        if (
+          args.domain === 'media_player' &&
+          args.action === 'set_volume' &&
+          args.volume_level !== null
+        ) {
+          await this.observeNumericPreference({
+            metric: 'volume_level',
+            value: args.volume_level,
+            areaName: learnedArea,
+            entityId,
+          })
+        }
+
+        if (args.domain === 'light' && args.action === 'turn_on' && args.brightness_pct !== null) {
+          await this.observeNumericPreference({
+            metric: 'brightness_pct',
+            value: args.brightness_pct,
+            areaName: learnedArea,
+            entityId,
+          })
+        }
+      }
+
       return JSON.stringify({
         ok: true,
         domain: args.domain,
@@ -1630,9 +2598,7 @@ export class HomeVoiceAgentController {
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-
       console.warn('[Home Voice Agent] Home Assistant control failed', error)
-
       return JSON.stringify({ ok: false, error: message })
     }
   }
@@ -1651,7 +2617,24 @@ export class HomeVoiceAgentController {
         entity: args.entity,
         wholeHome: args.whole_home,
       })
+
+      const entityId = entityIds[0]
+
       const wanted = new Set(entityIds)
+
+      if (args.entity && entityIds.length === 1 && entityId) {
+        const catalog = await this.getHomeCatalog()
+        const target = catalog.find(entity => entity.entity_id === entityId)
+
+        await this.observeLearnedAlias({
+          phrase: args.entity,
+          areaName:
+            args.area || target?.area_name || (!args.whole_home ? this.config.room || null : null),
+          domain: args.domain || target?.domain || null,
+          entityId,
+          evidence: 'successful_status',
+        })
+      }
 
       const entities = states
         .filter(state => wanted.has(state.entity_id))
@@ -1681,9 +2664,7 @@ export class HomeVoiceAgentController {
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-
       console.warn('[Home Voice Agent] Home Assistant status failed', error)
-
       return JSON.stringify({ ok: false, error: message })
     }
   }
@@ -1740,8 +2721,9 @@ export class HomeVoiceAgentController {
     entity: string | null
     wholeHome: boolean
   }): Promise<string[]> {
-    const catalog = await this.getHomeCatalog()
-    let candidates = catalog
+    await this.refreshHomeLearningMemory(false)
+
+    let candidates = await this.getHomeCatalog()
 
     if (options.domain) {
       candidates = candidates.filter(entity => entity.domain === options.domain)
@@ -1824,6 +2806,35 @@ export class HomeVoiceAgentController {
     candidates: HomeCatalogEntity[],
   ): string[] {
     const query = this.normalizeHomeName(requestedName)
+
+    const learnedDirect = this.homeLearningStore.aliases
+      .filter(
+        alias =>
+          alias.normalized_phrase === query &&
+          alias.confidence >= HOME_LEARNING_DIRECT_CONFIDENCE &&
+          candidates.some(entity => entity.entity_id === alias.entity_id),
+      )
+      .sort(
+        (a, b) =>
+          b.confidence - a.confidence ||
+          b.successful_uses - a.successful_uses ||
+          b.updated_at - a.updated_at,
+      )
+
+    if (
+      learnedDirect.length > 0 &&
+      learnedDirect[0] &&
+      (!learnedDirect[1] ||
+        learnedDirect[0].confidence - learnedDirect[1].confidence >= 0.08 ||
+        learnedDirect[0].entity_id === learnedDirect[1].entity_id)
+    ) {
+      const winner = learnedDirect[0]
+      winner.last_used_at = Date.now()
+      winner.updated_at = Date.now()
+      this.scheduleLearningSave()
+      return [winner.entity_id]
+    }
+
     const ranked = candidates
       .map(entity => ({ entity, score: this.scoreHomeEntity(query, entity) }))
       .filter(item => item.score > 0)
