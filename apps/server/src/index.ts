@@ -1,12 +1,16 @@
 import 'dotenv/config'
 
+import { resolve } from 'node:path'
+
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 
 import { verifyCloudflareAccess } from './cloudflare-access.js'
-import { verifyInternalSecret } from './internal-auth.js'
 import { config } from './config.js'
+import { registerMemoryRoutes } from './fastify-memory-routes.js'
+import { verifyInternalSecret } from './internal-auth.js'
+import { HomeVoiceMemoryStore } from './memory-store.js'
 import {
   createRealtimeClientSecret,
   OpenAIConfigurationError,
@@ -24,9 +28,7 @@ app.decorateRequest('accessIdentity', null)
 
 await app.register(cors, {
   credentials: true,
-
   methods: ['GET', 'POST', 'OPTIONS'],
-
   origin(origin, callback) {
     // Permit curl and other non-browser requests.
     // Authentication is still enforced on protected routes.
@@ -84,7 +86,7 @@ async function enforceRealtimeTokenRate(
 async function issueRealtimeToken(
   _request: FastifyRequest,
   reply: FastifyReply,
-): Promise<FastifyReply> {
+): Promise<unknown> {
   reply.header('Cache-Control', 'no-store, private')
 
   try {
@@ -117,6 +119,22 @@ async function issueRealtimeToken(
   }
 }
 
+const memoryDbPath =
+  process.env.HOME_VOICE_MEMORY_DB_PATH?.trim() ||
+  (config.NODE_ENV === 'development'
+    ? resolve(process.cwd(), 'data', 'memory.db')
+    : '/opt/home-voice-agent/data/memory.db')
+
+const memoryStore = new HomeVoiceMemoryStore({
+  path: memoryDbPath,
+})
+
+app.log.info({ memoryDbPath }, 'Persistent assistant memory initialized')
+
+app.addHook('onClose', async () => {
+  memoryStore.close()
+})
+
 app.get('/health', async () => ({
   status: 'ok',
   service: 'home-voice-agent-server',
@@ -141,6 +159,11 @@ app.post(
   },
   issueRealtimeToken,
 )
+
+await registerMemoryRoutes(app, {
+  store: memoryStore,
+  preHandler: verifyInternalSecret,
+})
 
 app.setNotFoundHandler(async (_request, reply) =>
   reply.status(404).send({
