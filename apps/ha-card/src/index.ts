@@ -36,9 +36,9 @@ const WAKE_CONFIG: KioskWakeConfig = {
   engine: 'microWakeWord',
   models: [
     {
-      id: 'hey_jarvis',
-      wakeWord: 'Hey Jarvis',
-      manifestUrl: 'http://homeassistant.local:8123/local/home-voice/hey_jarvis.json',
+      id: 'hey_harvey',
+      wakeWord: 'Hey Harvey',
+      manifestUrl: 'http://homeassistant.local:8123/local/home-voice/hey_harvey.json',
     },
   ],
 }
@@ -199,7 +199,7 @@ if (!window.__homeVoiceAgentKioskWakeConfigured && !window.__homeVoiceAgentKiosk
 }
 
 console.info(
-  '%c HOME VOICE AGENT %c v0.4.0 ',
+  '%c HOME VOICE AGENT %c v0.5.0 %c',
   'color:#fff;background:#596d87;font-weight:700;padding:3px 6px',
   'color:#596d87;background:#fff;font-weight:700;padding:3px 6px',
 )
