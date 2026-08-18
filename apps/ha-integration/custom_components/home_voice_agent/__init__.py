@@ -99,6 +99,7 @@ async def async_setup(
 
     for command in (
             websocket_realtime_token,
+            websocket_realtime_call,
             websocket_memory_context,
             websocket_memory_diagnostics,
             websocket_memory_alias_observe,
@@ -257,6 +258,48 @@ async def websocket_realtime_token(
         path="/internal/realtime/token",
         expected_status=201,
         json_body={},
+    )
+
+    if payload is None:
+        return
+
+    connection.send_result(
+        msg["id"],
+        payload,
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required(
+            "type"
+        ): "home_voice_agent/realtime_call",
+        vol.Required(
+            "sdp"
+        ): vol.All(
+            cv.string,
+            vol.Length(min=32, max=30000),
+        ),
+    }
+)
+@websocket_api.async_response
+async def websocket_realtime_call(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict,
+) -> None:
+    """Create an OpenAI Realtime WebRTC call from an SDP offer."""
+
+    payload = await _async_backend_request(
+        hass,
+        connection,
+        msg,
+        method="POST",
+        path="/internal/realtime/call",
+        expected_status=201,
+        json_body={
+            "sdp": msg["sdp"],
+        },
     )
 
     if payload is None:

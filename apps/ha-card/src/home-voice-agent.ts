@@ -10,6 +10,7 @@ export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' |
 
 export type VoiceAgentStartOptions = {
   inputReady?: boolean
+  activationStartedAt?: number
 }
 
 type PrepareInputHook = () => Promise<void> | void
@@ -341,7 +342,6 @@ type VoiceAgentConfig = {
   sensitiveEntityIds: string[]
   sensitiveDeviceIds: string[]
   nonSensitiveEntityIds: string[]
-  stopPhrases: string[]
 }
 
 type RealtimeTokenResponse = {
@@ -360,14 +360,6 @@ const DEFAULT_CONFIG: VoiceAgentConfig = {
   sensitiveEntityIds: [],
   sensitiveDeviceIds: [],
   nonSensitiveEntityIds: [],
-  stopPhrases: [
-    'ok ciao',
-    'okay ciao',
-    'ok ciao dona',
-    'okay ciao dona',
-    'ok ciao grazie',
-    'okay ciao grazie',
-  ],
 }
 
 const HOME_KNOWLEDGE_REFRESH_MS = 60_000
@@ -814,6 +806,9 @@ export class HomeVoiceAgentController {
   private session: RealtimeSession | null = null
   private activeAgentInstructions: string | null = null
   private audioElement: HTMLAudioElement | null = null
+  private inputMediaStream: MediaStream | null = null
+  private startupTraceStartedAt = 0
+  private startupTraceMarks = new Map<string, number>()
   private inactivityTimer: number | null = null
   private idleAfterErrorTimer: number | null = null
   private currentState: VoiceAgentState = 'idle'
@@ -877,9 +872,6 @@ export class HomeVoiceAgentController {
       nonSensitiveEntityIds: partialConfig.nonSensitiveEntityIds
         ? [...new Set(partialConfig.nonSensitiveEntityIds.filter(Boolean))]
         : this.config.nonSensitiveEntityIds,
-      stopPhrases: partialConfig.stopPhrases
-        ? [...new Set(partialConfig.stopPhrases.map(value => value.trim()).filter(Boolean))]
-        : this.config.stopPhrases,
     }
 
     for (const entity of this.homeCatalogCache) {
@@ -922,40 +914,62 @@ export class HomeVoiceAgentController {
   }
 
   public async start(options: VoiceAgentStartOptions = {}): Promise<void> {
-    const startupStartedAt = performance.now()
+    if (this.session || this.currentState === 'connecting') {
+      return
+    }
+
+    const startupStartedAt = options.activationStartedAt ?? performance.now()
+    this.beginStartupTrace(startupStartedAt)
+    this.markStartupTrace('start_entered')
+
     this.lastError = null
     this.pendingSensitiveAction = null
     this.userSpeechSequence = 0
     this.userSpeechItemSequences.clear()
     this.userSpeechTranscripts.clear()
 
-    if (this.session || this.currentState === 'connecting') {
-      return
-    }
-
     this.clearErrorTimer()
     this.setState('connecting')
 
     try {
-      // Start independent prerequisites together. The old path awaited microphone
-      // preparation, memory, token creation and area lookup sequentially, which made
-      // wake-word activation noticeably slower as features accumulated.
       const inputPreparation =
         !options.inputReady && this.prepareInputHook ? this.prepareInputHook() : Promise.resolve()
+
+      const mediaStreamPreparation = (async () => {
+        await inputPreparation
+        this.markStartupTrace('input_handoff_ready')
+        this.markStartupTrace('get_user_media_started')
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        })
+
+        this.inputMediaStream = stream
+        this.markStartupTrace('get_user_media_ready')
+        return stream
+      })()
+
       const memoryPreparation = this.refreshHomeLearningMemory(false)
-      const credentialPreparation = this.requestClientCredential()
+
+      const credentialPreparation = (async () => {
+        this.markStartupTrace('credential_request_started')
+        const credential = await this.requestClientCredential()
+        this.markStartupTrace('credential_received')
+        return credential
+      })()
+
       const homeAreasPreparation = this.getHomeAreas().catch(error => {
         console.warn('[Home Voice Agent] Could not load Home Assistant areas', error)
         return [] as HomeAreaEntry[]
       })
 
-      // Only the microphone handoff and Realtime credential are true connection
-      // prerequisites. Memory and HA area metadata are preloaded on bind and can
-      // safely finish in the background; if they change, the active agent gets a
-      // live instruction refresh after connection. This keeps wake latency out of
-      // the SQLite/HA metadata path entirely.
-      const [credential] = await Promise.all([credentialPreparation, inputPreparation])
+      const [credential, mediaStream] = await Promise.all([
+        credentialPreparation,
+        mediaStreamPreparation,
+      ])
+
       const homeAreas = this.homeAreasCache
+      this.markStartupTrace('startup_prerequisites_ready')
 
       console.debug('[Home Voice Agent] Startup prerequisites ready', {
         elapsedMs: Math.round(performance.now() - startupStartedAt),
@@ -971,12 +985,14 @@ export class HomeVoiceAgentController {
 
       const transport = new OpenAIRealtimeWebRTC({
         audioElement,
+        mediaStream,
       })
+      this.markStartupTrace('transport_created')
 
       const agentInstructions = this.buildAgentInstructions(homeAreas)
       const agent = new RealtimeAgent({
-        name: 'Dona',
-        voice: 'marin',
+        name: 'Harvey',
+        voice: 'cedar',
         instructions: agentInstructions,
         tools: this.createHomeAssistantTools(),
       })
@@ -1006,7 +1022,7 @@ export class HomeVoiceAgentController {
               },
             },
             output: {
-              voice: 'marin',
+              voice: 'cedar',
               speed: 0.96,
             },
           },
@@ -1019,6 +1035,7 @@ export class HomeVoiceAgentController {
 
       session.transport.on('connection_change', connectionState => {
         if (connectionState === 'connected') {
+          this.markStartupTrace('transport_connected')
           console.debug('[Home Voice Agent] Realtime connected', {
             activationMs: Math.round(performance.now() - startupStartedAt),
           })
@@ -1055,13 +1072,14 @@ export class HomeVoiceAgentController {
 
       session.on('error', error => {
         console.error('[Home Voice Agent] Realtime error', error)
-
         this.handleError(error)
       })
 
+      this.markStartupTrace('session_connect_started')
       await session.connect({
         apiKey: credential.value,
       })
+      this.markStartupTrace('session_connect_resolved')
 
       void Promise.allSettled([memoryPreparation, homeAreasPreparation]).then(() => {
         if (this.session === session) {
@@ -1070,7 +1088,6 @@ export class HomeVoiceAgentController {
       })
     } catch (error) {
       console.error('[Home Voice Agent] Connection failed', error)
-
       this.handleError(error)
     }
   }
@@ -1087,6 +1104,16 @@ export class HomeVoiceAgentController {
     this.stopping = false
   }
 
+  public hardStop(): void {
+    try {
+      this.session?.interrupt()
+    } catch (error) {
+      console.warn('[Home Voice Agent] Could not interrupt Realtime before stop', error)
+    }
+
+    this.stop()
+  }
+
   public interrupt(): void {
     this.session?.interrupt()
   }
@@ -1097,7 +1124,17 @@ export class HomeVoiceAgentController {
     const payload = event as Record<string, unknown>
     const type = typeof payload.type === 'string' ? payload.type : ''
 
+    if (type === 'response.created') {
+      this.markStartupTraceOnce('first_response_created')
+    }
+
+    if (type === 'output_audio_buffer.started') {
+      this.markStartupTraceOnce('first_output_audio_started')
+      this.logStartupTraceSummary()
+    }
+
     if (type === 'input_audio_buffer.speech_started') {
+      this.markStartupTraceOnce('first_speech_started')
       this.userSpeechSequence += 1
 
       if (typeof payload.item_id === 'string') {
@@ -1130,18 +1167,6 @@ export class HomeVoiceAgentController {
       if (!transcript) return
 
       const normalized = this.normalizeConfirmationSpeech(transcript)
-
-      const shouldStop = this.config.stopPhrases.some(
-        phrase => this.normalizeConfirmationSpeech(phrase) === normalized,
-      )
-
-      if (shouldStop) {
-        console.info('[Home Voice Agent] Session stop phrase detected', {
-          transcript,
-        })
-        this.stop()
-        return
-      }
 
       this.userSpeechTranscripts.set(sequence, {
         sequence,
@@ -1380,8 +1405,8 @@ ${preferences.join('\n')}`
     if (instructions === this.activeAgentInstructions) return
 
     const updatedAgent = new RealtimeAgent({
-      name: 'Dona',
-      voice: 'marin',
+      name: 'Harvey',
+      voice: 'cedar',
       instructions,
       tools: this.createHomeAssistantTools(),
     })
@@ -3614,7 +3639,7 @@ ${preferences.join('\n')}`
     if (best && best.score < 80) return []
 
     // Exact/very strong matches are safe to choose. For fuzzier matches we
-    // require a useful lead over the runner-up so Dona does not guess between
+    // require a useful lead over the runner-up so Harvey does not guess between
     // two similar devices.
     if (best && (best.score >= 220 || !second || best.score - second.score >= 25)) {
       return [best.entity.entity_id]
@@ -3740,6 +3765,42 @@ ${preferences.join('\n')}`
       .trim()
   }
 
+  private beginStartupTrace(startedAt: number): void {
+    this.startupTraceStartedAt = startedAt
+    this.startupTraceMarks.clear()
+    this.startupTraceMarks.set('activation', 0)
+  }
+
+  private markStartupTrace(stage: string): void {
+    if (this.startupTraceStartedAt <= 0) return
+
+    const elapsedMs = performance.now() - this.startupTraceStartedAt
+    this.startupTraceMarks.set(stage, elapsedMs)
+
+    console.debug('[Home Voice Agent] Startup trace', {
+      stage,
+      elapsedMs: Math.round(elapsedMs),
+    })
+  }
+
+  private markStartupTraceOnce(stage: string): void {
+    if (this.startupTraceMarks.has(stage)) return
+    this.markStartupTrace(stage)
+  }
+
+  private logStartupTraceSummary(): void {
+    if (this.startupTraceStartedAt <= 0) return
+
+    const timings = Object.fromEntries(
+      [...this.startupTraceMarks.entries()].map(([stage, elapsedMs]) => [
+        stage,
+        Math.round(elapsedMs),
+      ]),
+    )
+
+    console.info('[Home Voice Agent] Startup timing summary', JSON.stringify(timings))
+  }
+
   private async requestClientCredential(): Promise<{
     value: string
     model: string
@@ -3850,6 +3911,7 @@ ${preferences.join('\n')}`
   private releaseSession(): void {
     const session = this.session
     const audioElement = this.audioElement
+    const inputMediaStream = this.inputMediaStream
     const audioContext = this.audioContext
 
     if (this.homeLearningAgentUpdateTimer !== null) {
@@ -3860,6 +3922,7 @@ ${preferences.join('\n')}`
     this.session = null
     this.activeAgentInstructions = null
     this.audioElement = null
+    this.inputMediaStream = null
 
     this.audioContext = null
     this.audioSource = null
@@ -3876,6 +3939,12 @@ ${preferences.join('\n')}`
       audioElement.pause()
       audioElement.srcObject = null
       audioElement.removeAttribute('src')
+    }
+
+    if (inputMediaStream) {
+      for (const track of inputMediaStream.getTracks()) {
+        track.stop()
+      }
     }
 
     if (audioContext) {

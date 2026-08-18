@@ -12,6 +12,7 @@ import { registerMemoryRoutes } from './fastify-memory-routes.js'
 import { verifyInternalSecret } from './internal-auth.js'
 import { HomeVoiceMemoryStore } from './memory-store.js'
 import {
+  createRealtimeCall,
   createRealtimeClientSecret,
   OpenAIConfigurationError,
   OpenAIRealtimeError,
@@ -89,8 +90,16 @@ async function issueRealtimeToken(
 ): Promise<unknown> {
   reply.header('Cache-Control', 'no-store, private')
 
+  const startedAt = performance.now()
+
   try {
     const clientSecret = await createRealtimeClientSecret()
+
+    app.log.info(
+      { durationMs: Math.round(performance.now() - startedAt) },
+      'Realtime credential created',
+    )
+
     return reply.status(201).send(clientSecret)
   } catch (error) {
     if (error instanceof OpenAIConfigurationError) {
@@ -112,6 +121,73 @@ async function issueRealtimeToken(
       return reply.status(502).send({
         error: 'realtime_client_secret_failed',
         message: 'Could not create a Realtime credential.',
+      })
+    }
+
+    throw error
+  }
+}
+
+
+async function issueRealtimeCall(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<unknown> {
+  reply.header('Cache-Control', 'no-store, private')
+
+  const body = request.body
+
+  if (!body || typeof body !== 'object' || !('sdp' in body)) {
+    return reply.status(400).send({
+      error: 'invalid_realtime_offer',
+      message: 'A WebRTC SDP offer is required.',
+    })
+  }
+
+  const sdp = (body as { sdp?: unknown }).sdp
+
+  if (typeof sdp !== 'string' || sdp.length < 32 || sdp.length > 30_000) {
+    return reply.status(400).send({
+      error: 'invalid_realtime_offer',
+      message: 'The WebRTC SDP offer is invalid.',
+    })
+  }
+
+  const startedAt = performance.now()
+
+  try {
+    const call = await createRealtimeCall(sdp)
+
+    app.log.info(
+      {
+        durationMs: Math.round(performance.now() - startedAt),
+        hasLocation: Boolean(call.location),
+      },
+      'Realtime SDP call created',
+    )
+
+    return reply.status(201).send(call)
+  } catch (error) {
+    if (error instanceof OpenAIConfigurationError) {
+      return reply.status(503).send({
+        error: 'openai_not_configured',
+        message: 'The OpenAI API key is not configured.',
+      })
+    }
+
+    if (error instanceof OpenAIRealtimeError) {
+      app.log.error(
+        {
+          statusCode: error.statusCode,
+          error: error.message,
+          durationMs: Math.round(performance.now() - startedAt),
+        },
+        'Failed to create Realtime SDP call',
+      )
+
+      return reply.status(502).send({
+        error: 'realtime_call_failed',
+        message: 'Could not create a Realtime WebRTC call.',
       })
     }
 
@@ -158,6 +234,15 @@ app.post(
     preHandler: [verifyInternalSecret, enforceRealtimeTokenRate],
   },
   issueRealtimeToken,
+)
+
+
+app.post(
+  '/internal/realtime/call',
+  {
+    preHandler: [verifyInternalSecret, enforceRealtimeTokenRate],
+  },
+  issueRealtimeCall,
 )
 
 await registerMemoryRoutes(app, {

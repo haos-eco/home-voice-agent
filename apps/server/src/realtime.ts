@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { config } from './config.js'
 
 const OPENAI_CLIENT_SECRETS_URL = 'https://api.openai.com/v1/realtime/client_secrets'
+const OPENAI_REALTIME_CALLS_URL = 'https://api.openai.com/v1/realtime/calls'
 
 export class OpenAIConfigurationError extends Error {
   constructor() {
@@ -21,32 +22,47 @@ export class OpenAIRealtimeError extends Error {
   }
 }
 
+export type RealtimeCallResult = {
+  sdp: string
+  location: string | null
+}
+
 function createSafetyIdentifier(): string {
   return createHash('sha256').update(config.OPENAI_SAFETY_USER_ID).digest('hex')
 }
 
-export async function createRealtimeClientSecret(): Promise<unknown> {
+function requireOpenAIKey(): string {
   if (!config.OPENAI_API_KEY) {
     throw new OpenAIConfigurationError()
   }
 
+  return config.OPENAI_API_KEY
+}
+
+function baseRealtimeSessionConfig(): Record<string, unknown> {
+  return {
+    type: 'realtime',
+    model: config.REALTIME_MODEL,
+    audio: {
+      output: {
+        voice: config.REALTIME_VOICE,
+      },
+    },
+  }
+}
+
+export async function createRealtimeClientSecret(): Promise<unknown> {
+  const apiKey = requireOpenAIKey()
+
   const response = await fetch(OPENAI_CLIENT_SECRETS_URL, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${config.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       'OpenAI-Safety-Identifier': createSafetyIdentifier(),
     },
     body: JSON.stringify({
-      session: {
-        type: 'realtime',
-        model: config.REALTIME_MODEL,
-        audio: {
-          output: {
-            voice: config.REALTIME_VOICE,
-          },
-        },
-      },
+      session: baseRealtimeSessionConfig(),
     }),
     signal: AbortSignal.timeout(15_000),
   })
@@ -54,7 +70,6 @@ export async function createRealtimeClientSecret(): Promise<unknown> {
   const responseText = await response.text()
 
   if (!response.ok) {
-    // Loggable error without leaking the permanent API key.
     throw new OpenAIRealtimeError(
       `OpenAI returned HTTP ${response.status}: ${responseText}`,
       response.status,
@@ -65,5 +80,41 @@ export async function createRealtimeClientSecret(): Promise<unknown> {
     return JSON.parse(responseText) as unknown
   } catch {
     throw new OpenAIRealtimeError('OpenAI returned an invalid JSON response.', 502)
+  }
+}
+
+export async function createRealtimeCall(sdpOffer: string): Promise<RealtimeCallResult> {
+  const apiKey = requireOpenAIKey()
+
+  const form = new FormData()
+  form.append('sdp', sdpOffer)
+  form.append('session', JSON.stringify(baseRealtimeSessionConfig()))
+
+  const response = await fetch(OPENAI_REALTIME_CALLS_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'OpenAI-Safety-Identifier': createSafetyIdentifier(),
+    },
+    body: form,
+    signal: AbortSignal.timeout(15_000),
+  })
+
+  const answer = await response.text()
+
+  if (!response.ok) {
+    throw new OpenAIRealtimeError(
+      `OpenAI returned HTTP ${response.status}: ${answer}`,
+      response.status,
+    )
+  }
+
+  if (!answer.trim()) {
+    throw new OpenAIRealtimeError('OpenAI returned an empty SDP answer.', 502)
+  }
+
+  return {
+    sdp: answer,
+    location: response.headers.get('location'),
   }
 }

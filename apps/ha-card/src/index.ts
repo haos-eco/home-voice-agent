@@ -36,9 +36,10 @@ const WAKE_CONFIG: KioskWakeConfig = {
   engine: 'microWakeWord',
   models: [
     {
-      id: 'hey_harvey',
-      wakeWord: 'Hey Harvey',
-      manifestUrl: 'http://homeassistant.local:8123/local/home-voice/hey_harvey.json',
+      id: 'hey_jarvis',
+      wakeWord: 'Hey Jarvis',
+      manifestUrl:
+        'https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/hey_jarvis.json',
     },
   ],
 }
@@ -117,16 +118,15 @@ agent.setPrepareInputHook(async () => {
 })
 
 /*
- * Wake-word event.
- *
- * Do NOT pass inputReady: true here.
- * agent.start() must execute prepareInputHook so Kiosk Satellite
- * releases its microphone before Realtime takes control.
+ * Kiosk Satellite dispatches the wake event after native microphone
+ * capture has already stopped, so Realtime can acquire the browser
+ * microphone immediately without another release round-trip.
  */
 if (!window.__homeVoiceAgentKioskWakeBound) {
   window.__homeVoiceAgentKioskWakeBound = true
 
   window.addEventListener('kiosksatellite:wakeword', (event: Event) => {
+    const activationStartedAt = performance.now()
     const detail = (
       event as CustomEvent<{
         model?: string
@@ -140,7 +140,10 @@ if (!window.__homeVoiceAgentKioskWakeBound) {
       detail?.model ?? '',
     )
 
-    void agent.start()
+    void agent.start({
+      inputReady: true,
+      activationStartedAt,
+    })
   })
 }
 
@@ -199,7 +202,7 @@ if (!window.__homeVoiceAgentKioskWakeConfigured && !window.__homeVoiceAgentKiosk
 }
 
 console.info(
-  '%c HOME VOICE AGENT %c v0.5.0 %c',
+  '%c HOME VOICE AGENT %c v0.6.0 %c',
   'color:#fff;background:#596d87;font-weight:700;padding:3px 6px',
   'color:#596d87;background:#fff;font-weight:700;padding:3px 6px',
 )
