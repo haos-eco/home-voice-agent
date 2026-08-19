@@ -135,23 +135,30 @@ export async function registerMemoryRoutes(
     }
   })
 
-  app.post('/internal/memory/catalog/reconcile', protectedRoute, async (request, reply) => {
-    try {
-      const body = (request.body ?? {}) as {
-        entity_ids?: unknown
-        at?: number
-      }
+  app.post(
+    '/internal/memory/catalog/reconcile',
+    {
+      ...protectedRoute,
+      bodyLimit: 1024 * 1024,
+    },
+    async (request, reply) => {
+      try {
+        const body = (request.body ?? {}) as {
+          entity_ids?: unknown
+          at?: number
+        }
 
-      return options.store.reconcileCatalog({
-        entity_ids: Array.isArray(body.entity_ids)
-          ? body.entity_ids.filter((value): value is string => typeof value === 'string')
-          : (body.entity_ids as string[]),
-        at: body.at,
-      })
-    } catch (error) {
-      return badRequest(reply, error)
-    }
-  })
+        return options.store.reconcileCatalog({
+          entity_ids: Array.isArray(body.entity_ids)
+            ? body.entity_ids.filter((value): value is string => typeof value === 'string')
+            : (body.entity_ids as string[]),
+          at: body.at,
+        })
+      } catch (error) {
+        return badRequest(reply, error)
+      }
+    },
+  )
 
   app.post(
     '/internal/memory/import',

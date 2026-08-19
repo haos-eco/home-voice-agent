@@ -25,6 +25,7 @@ export class OpenAIRealtimeError extends Error {
 export type RealtimeCallResult = {
   sdp: string
   location: string | null
+  model: string
 }
 
 function createSafetyIdentifier(): string {
@@ -87,8 +88,16 @@ export async function createRealtimeCall(sdpOffer: string): Promise<RealtimeCall
   const apiKey = requireOpenAIKey()
 
   const form = new FormData()
-  form.append('sdp', sdpOffer)
-  form.append('session', JSON.stringify(baseRealtimeSessionConfig()))
+  form.append(
+    'sdp',
+    new Blob([sdpOffer], { type: 'application/sdp' }),
+    'offer.sdp',
+  )
+  form.append(
+    'session',
+    new Blob([JSON.stringify(baseRealtimeSessionConfig())], { type: 'application/json' }),
+    'session.json',
+  )
 
   const response = await fetch(OPENAI_REALTIME_CALLS_URL, {
     method: 'POST',
@@ -116,5 +125,6 @@ export async function createRealtimeCall(sdpOffer: string): Promise<RealtimeCall
   return {
     sdp: answer,
     location: response.headers.get('location'),
+    model: config.REALTIME_MODEL,
   }
 }

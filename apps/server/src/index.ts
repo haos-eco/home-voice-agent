@@ -4,7 +4,7 @@ import { resolve } from 'node:path'
 
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
+import Fastify, { type FastifyError, type FastifyReply, type FastifyRequest } from 'fastify'
 
 import { verifyCloudflareAccess } from './cloudflare-access.js'
 import { config } from './config.js'
@@ -84,10 +84,7 @@ async function enforceRealtimeTokenRate(
   })
 }
 
-async function issueRealtimeToken(
-  _request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<unknown> {
+async function issueRealtimeToken(_request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   reply.header('Cache-Control', 'no-store, private')
 
   const startedAt = performance.now()
@@ -128,11 +125,7 @@ async function issueRealtimeToken(
   }
 }
 
-
-async function issueRealtimeCall(
-  request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<unknown> {
+async function issueRealtimeCall(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   reply.header('Cache-Control', 'no-store, private')
 
   const body = request.body
@@ -236,7 +229,6 @@ app.post(
   issueRealtimeToken,
 )
 
-
 app.post(
   '/internal/realtime/call',
   {
@@ -256,12 +248,28 @@ app.setNotFoundHandler(async (_request, reply) =>
   }),
 )
 
-app.setErrorHandler(async (error, _request, reply) => {
-  app.log.error(error)
+app.setErrorHandler(async (error: FastifyError, _request, reply) => {
+  const statusCode =
+    typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode <= 599
+      ? error.statusCode
+      : 500
 
-  return reply.status(500).send({
-    error: 'internal_server_error',
-    message: 'The voice-agent server encountered an unexpected error.',
+  if (statusCode >= 500) app.log.error(error)
+  else app.log.warn(error)
+
+  return reply.status(statusCode).send({
+    error:
+      statusCode === 413
+        ? 'request_body_too_large'
+        : statusCode >= 500
+          ? 'internal_server_error'
+          : 'request_failed',
+    message:
+      statusCode === 413
+        ? 'The request body exceeds the allowed size.'
+        : statusCode >= 500
+          ? 'The voice-agent server encountered an unexpected error.'
+          : error.message,
   })
 })
 

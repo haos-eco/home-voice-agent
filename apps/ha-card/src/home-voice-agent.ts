@@ -1,10 +1,7 @@
-import {
-  OpenAIRealtimeWebRTC,
-  RealtimeAgent,
-  RealtimeSession,
-  tool,
-  type OpenAIRealtimeModels,
-} from '@openai/agents/realtime'
+import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime'
+
+import { HomeAssistantRealtimeWebRTC } from './home-assistant-realtime-webrtc'
+import { WakeAudioPrebuffer } from './wake-audio-prebuffer'
 
 export type VoiceAgentState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
 
@@ -342,14 +339,6 @@ type VoiceAgentConfig = {
   sensitiveEntityIds: string[]
   sensitiveDeviceIds: string[]
   nonSensitiveEntityIds: string[]
-}
-
-type RealtimeTokenResponse = {
-  value?: unknown
-  session?: {
-    model?: unknown
-  }
-  message?: unknown
 }
 
 const DEFAULT_CONFIG: VoiceAgentConfig = {
@@ -807,6 +796,7 @@ export class HomeVoiceAgentController {
   private activeAgentInstructions: string | null = null
   private audioElement: HTMLAudioElement | null = null
   private inputMediaStream: MediaStream | null = null
+  private wakeAudioPrebuffer: WakeAudioPrebuffer | null = null
   private startupTraceStartedAt = 0
   private startupTraceMarks = new Map<string, number>()
   private inactivityTimer: number | null = null
@@ -932,10 +922,14 @@ export class HomeVoiceAgentController {
     this.setState('connecting')
 
     try {
+      if (!this.hass) {
+        throw new Error('Home Assistant is not connected.')
+      }
+
       const inputPreparation =
         !options.inputReady && this.prepareInputHook ? this.prepareInputHook() : Promise.resolve()
 
-      const mediaStreamPreparation = (async () => {
+      const mediaPreparation = (async () => {
         await inputPreparation
         this.markStartupTrace('input_handoff_ready')
         this.markStartupTrace('get_user_media_started')
@@ -946,49 +940,53 @@ export class HomeVoiceAgentController {
 
         this.inputMediaStream = stream
         this.markStartupTrace('get_user_media_ready')
-        return stream
+
+        const prebuffer = new WakeAudioPrebuffer(stream, 24_000, 8_000, () => {
+          this.markStartupTraceOnce('prebuffer_first_audio')
+        })
+        this.wakeAudioPrebuffer = prebuffer
+        await prebuffer.start()
+        this.markStartupTrace('prebuffer_started')
+
+        const sourceTrack = stream.getAudioTracks()[0]
+        if (!sourceTrack) {
+          throw new Error('No microphone audio track is available.')
+        }
+
+        // Keep the original track feeding the local prebuffer. A disabled clone is
+        // attached to WebRTC as soon as it exists, but it stays silent until the
+        // buffered post-wake speech has been replayed over the Realtime data channel.
+        const realtimeTrack = sourceTrack.clone()
+        realtimeTrack.enabled = false
+
+        this.markStartupTrace('media_pipeline_ready')
+        return { stream, realtimeTrack }
       })()
 
+      // These are deliberately background work. Neither memory refresh nor area
+      // discovery is allowed to delay the Realtime handshake.
       const memoryPreparation = this.refreshHomeLearningMemory(false)
-
-      const credentialPreparation = (async () => {
-        this.markStartupTrace('credential_request_started')
-        const credential = await this.requestClientCredential()
-        this.markStartupTrace('credential_received')
-        return credential
-      })()
-
       const homeAreasPreparation = this.getHomeAreas().catch(error => {
         console.warn('[Home Voice Agent] Could not load Home Assistant areas', error)
         return [] as HomeAreaEntry[]
       })
 
-      const [credential, mediaStream] = await Promise.all([
-        credentialPreparation,
-        mediaStreamPreparation,
-      ])
-
-      const homeAreas = this.homeAreasCache
-      this.markStartupTrace('startup_prerequisites_ready')
-
-      console.debug('[Home Voice Agent] Startup prerequisites ready', {
-        elapsedMs: Math.round(performance.now() - startupStartedAt),
-        memoryLoaded: this.homeLearningLoaded,
-        memoryRevision: this.homeLearningStore.revision,
-        cachedAreas: homeAreas.length,
-        backgroundMemoryRefresh: !this.homeLearningLoaded,
-        backgroundAreaRefresh: homeAreas.length === 0,
-      })
-
       const audioElement = document.createElement('audio')
       audioElement.autoplay = true
 
-      const transport = new OpenAIRealtimeWebRTC({
+      // The custom transport creates an audio transceiver immediately. It does not
+      // wait for getUserMedia before creating/sending the SDP offer; when the real
+      // microphone clone becomes available, replaceTrack() attaches it without a
+      // second negotiation.
+      const transport = new HomeAssistantRealtimeWebRTC({
+        hass: this.hass,
         audioElement,
-        mediaStream,
+        audioTrackPromise: mediaPreparation.then(result => result.realtimeTrack),
+        onTrace: stage => this.markStartupTrace(stage),
       })
       this.markStartupTrace('transport_created')
 
+      const homeAreas = this.homeAreasCache
       const agentInstructions = this.buildAgentInstructions(homeAreas)
       const agent = new RealtimeAgent({
         name: 'Harvey',
@@ -1000,7 +998,6 @@ export class HomeVoiceAgentController {
 
       const session = new RealtimeSession(agent, {
         transport,
-        model: credential.model as OpenAIRealtimeModels,
         config: {
           outputModalities: ['audio'],
           reasoning: {
@@ -1040,8 +1037,6 @@ export class HomeVoiceAgentController {
             activationMs: Math.round(performance.now() - startupStartedAt),
           })
           void this.setupBoostedAudio(audioElement)
-          this.setState('listening')
-          this.resetInactivityTimer()
           return
         }
 
@@ -1075,11 +1070,59 @@ export class HomeVoiceAgentController {
         this.handleError(error)
       })
 
+      // Start SDP/WebRTC immediately. Microphone acquisition and prebuffer setup are
+      // already running in parallel above, rather than blocking this call.
       this.markStartupTrace('session_connect_started')
-      await session.connect({
-        apiKey: credential.value,
+      const connectionPreparation = session.connect({ apiKey: 'server-proxied' }).then(() => {
+        this.markStartupTrace('session_connect_resolved')
       })
-      this.markStartupTrace('session_connect_resolved')
+
+      const media = await mediaPreparation
+      this.markStartupTrace('startup_prerequisites_ready')
+
+      console.debug(
+        '[Home Voice Agent] Startup prerequisites ready',
+        JSON.stringify({
+          elapsedMs: Math.round(performance.now() - startupStartedAt),
+          memoryLoaded: this.homeLearningLoaded,
+          memoryRevision: this.homeLearningStore.revision,
+          cachedAreas: homeAreas.length,
+          backgroundMemoryRefresh: !this.homeLearningLoaded,
+          backgroundAreaRefresh: homeAreas.length === 0,
+          transport: 'direct-sdp-via-home-assistant',
+        }),
+      )
+
+      await connectionPreparation
+
+      // Stop the local recorder first, replay all post-wake PCM into Realtime in
+      // chronological order, then enable the live WebRTC track. This prevents live
+      // RTP audio from overtaking the buffered beginning of the command.
+      const prebuffer = this.wakeAudioPrebuffer
+      this.markStartupTrace('prebuffer_flush_started')
+      const bufferedAudio = prebuffer ? await prebuffer.stopAndTake() : []
+      this.wakeAudioPrebuffer = null
+
+      let bufferedBytes = 0
+      for (const chunk of bufferedAudio) {
+        bufferedBytes += chunk.byteLength
+        session.sendAudio(chunk)
+      }
+      this.markStartupTrace('prebuffer_flush_finished')
+
+      media.realtimeTrack.enabled = true
+      this.markStartupTrace('live_audio_enabled')
+      this.setState('listening')
+      this.resetInactivityTimer()
+
+      console.debug(
+        '[Home Voice Agent] Wake audio prebuffer flushed',
+        JSON.stringify({
+          chunks: bufferedAudio.length,
+          bytes: bufferedBytes,
+          audioMs: Math.round((bufferedBytes / 2 / 24_000) * 1000),
+        }),
+      )
 
       void Promise.allSettled([memoryPreparation, homeAreasPreparation]).then(() => {
         if (this.session === session) {
@@ -1126,6 +1169,18 @@ export class HomeVoiceAgentController {
 
     if (type === 'response.created') {
       this.markStartupTraceOnce('first_response_created')
+    }
+
+    if (type === 'input_audio_buffer.speech_stopped') {
+      this.markStartupTraceOnce('first_speech_stopped')
+    }
+
+    if (type === 'response.function_call_arguments.done') {
+      this.markStartupTraceOnce('first_tool_call_ready')
+    }
+
+    if (type === 'response.done') {
+      this.markStartupTraceOnce('first_response_done')
     }
 
     if (type === 'output_audio_buffer.started') {
@@ -3801,34 +3856,6 @@ ${preferences.join('\n')}`
     console.info('[Home Voice Agent] Startup timing summary', JSON.stringify(timings))
   }
 
-  private async requestClientCredential(): Promise<{
-    value: string
-    model: string
-  }> {
-    if (!this.hass) {
-      throw new Error('Home Assistant is not connected.')
-    }
-
-    const payload = await this.hass.callWS<RealtimeTokenResponse>({
-      type: 'home_voice_agent/realtime_token',
-    })
-
-    if (typeof payload.value !== 'string' || payload.value.length === 0) {
-      const message =
-        typeof payload.message === 'string'
-          ? payload.message
-          : 'Home Assistant returned no Realtime credential.'
-
-      throw new Error(message)
-    }
-
-    return {
-      value: payload.value,
-      model:
-        typeof payload.session?.model === 'string' ? payload.session.model : 'gpt-realtime-2.1',
-    }
-  }
-
   private setState(state: VoiceAgentState): void {
     if (state === this.currentState) {
       return
@@ -3912,6 +3939,7 @@ ${preferences.join('\n')}`
     const session = this.session
     const audioElement = this.audioElement
     const inputMediaStream = this.inputMediaStream
+    const wakeAudioPrebuffer = this.wakeAudioPrebuffer
     const audioContext = this.audioContext
 
     if (this.homeLearningAgentUpdateTimer !== null) {
@@ -3923,11 +3951,18 @@ ${preferences.join('\n')}`
     this.activeAgentInstructions = null
     this.audioElement = null
     this.inputMediaStream = null
+    this.wakeAudioPrebuffer = null
 
     this.audioContext = null
     this.audioSource = null
     this.audioGain = null
     this.audioCompressor = null
+
+    if (wakeAudioPrebuffer) {
+      void wakeAudioPrebuffer.discard().catch(error => {
+        console.warn('[Home Voice Agent] Error discarding wake audio prebuffer', error)
+      })
+    }
 
     try {
       session?.close()
