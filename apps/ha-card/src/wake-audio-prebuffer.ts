@@ -1,8 +1,8 @@
 const DEFAULT_TARGET_SAMPLE_RATE = 24_000
 const DEFAULT_MAX_BUFFER_MS = 8_000
-const WORKLET_CHUNK_MS = 40
-const LEADING_PREROLL_MS = 240
-const MIN_SPEECH_RUN_MS = 80
+const WORKLET_CHUNK_MS = 20
+const LEADING_PREROLL_MS = 160
+const MIN_SPEECH_RUN_MS = 60
 
 export type WakeAudioCaptureEngine = 'audio-worklet' | 'script-processor-fallback'
 
@@ -15,6 +15,9 @@ export type WakeAudioPrebufferResult = {
   firstSpeechOffsetMs: number | null
   noiseFloorDb: number | null
   speechThresholdDb: number | null
+  maxRmsDb: number | null
+  maxPeak: number | null
+  workletPrewarmed: boolean
 }
 
 type BufferedChunk = {
@@ -24,14 +27,19 @@ type BufferedChunk = {
   peak: number
 }
 
+type SharedWorkletRuntime = {
+  context: AudioContext
+  prewarmedAt: number
+}
+
 const WORKLET_SOURCE = `
 class HomeVoiceWakePrebufferProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super()
-    const requestedChunkMs = Number(options?.processorOptions?.chunkMs ?? 40)
+    const requestedChunkMs = Number(options?.processorOptions?.chunkMs ?? 20)
     const chunkMs = Number.isFinite(requestedChunkMs)
       ? Math.max(10, Math.min(100, requestedChunkMs))
-      : 40
+      : 20
 
     this.chunkFrames = Math.max(128, Math.round(sampleRate * chunkMs / 1000))
     this.buffer = new Float32Array(this.chunkFrames)
@@ -94,6 +102,66 @@ class HomeVoiceWakePrebufferProcessor extends AudioWorkletProcessor {
 registerProcessor('home-voice-wake-prebuffer', HomeVoiceWakePrebufferProcessor)
 `
 
+let sharedWorkletRuntimePromise: Promise<SharedWorkletRuntime> | null = null
+
+async function createSharedWorkletRuntime(): Promise<SharedWorkletRuntime> {
+  if (typeof AudioContext === 'undefined' || typeof AudioWorkletNode === 'undefined') {
+    throw new Error('AudioWorklet is not supported by this browser.')
+  }
+
+  const context = new AudioContext({ latencyHint: 'interactive' })
+
+  if (!context.audioWorklet) {
+    await context.close().catch(() => undefined)
+    throw new Error('AudioWorklet is not supported by this browser.')
+  }
+
+  const module = new Blob([WORKLET_SOURCE], { type: 'text/javascript' })
+  const moduleUrl = URL.createObjectURL(module)
+
+  try {
+    await context.audioWorklet.addModule(moduleUrl)
+  } catch (error) {
+    await context.close().catch(() => undefined)
+    throw error
+  } finally {
+    URL.revokeObjectURL(moduleUrl)
+  }
+
+  return {
+    context,
+    prewarmedAt: performance.now(),
+  }
+}
+
+async function getSharedWorkletRuntime(): Promise<SharedWorkletRuntime> {
+  if (!sharedWorkletRuntimePromise) {
+    sharedWorkletRuntimePromise = createSharedWorkletRuntime().catch(error => {
+      sharedWorkletRuntimePromise = null
+      throw error
+    })
+  }
+
+  return sharedWorkletRuntimePromise
+}
+
+/**
+ * Load the AudioWorklet module before a wake word happens. This does not request
+ * microphone access, so Kiosk Satellite keeps owning the input device while idle.
+ */
+export async function prewarmWakeAudioWorklet(): Promise<boolean> {
+  try {
+    const runtime = await getSharedWorkletRuntime()
+    console.debug('[Home Voice Agent] Wake audio worklet prewarmed', {
+      state: runtime.context.state,
+    })
+    return true
+  } catch (error) {
+    console.warn('[Home Voice Agent] Wake audio worklet prewarm unavailable', error)
+    return false
+  }
+}
+
 export class WakeAudioPrebuffer {
   private context: AudioContext | null = null
   private source: MediaStreamAudioSourceNode | null = null
@@ -104,6 +172,8 @@ export class WakeAudioPrebuffer {
   private bufferedSamples = 0
   private started = false
   private captureEngine: WakeAudioCaptureEngine = 'audio-worklet'
+  private usingSharedContext = false
+  private workletPrewarmed = false
 
   constructor(
     private readonly stream: MediaStream,
@@ -116,32 +186,59 @@ export class WakeAudioPrebuffer {
     if (this.started) return this.captureEngine
     this.started = true
 
-    const context = new AudioContext({ latencyHint: 'interactive' })
-    const source = context.createMediaStreamSource(this.stream)
-    const sink = context.createGain()
-    sink.gain.value = 0
-
-    this.context = context
-    this.source = source
-    this.sink = sink
-
-    if (context.state === 'suspended') {
-      await context.resume()
-    }
-
     try {
-      await this.startAudioWorklet(context, source, sink)
+      const waitStartedAt = performance.now()
+      const runtime = await getSharedWorkletRuntime()
+      const context = runtime.context
+      this.workletPrewarmed = runtime.prewarmedAt <= waitStartedAt
+
+      if (context.state === 'suspended') {
+        await context.resume()
+      }
+
+      if (context.state === 'closed') {
+        sharedWorkletRuntimePromise = null
+        throw new Error('The prewarmed AudioContext was closed.')
+      }
+
+      const source = context.createMediaStreamSource(this.stream)
+      const sink = context.createGain()
+      sink.gain.value = 0
+
+      this.context = context
+      this.source = source
+      this.sink = sink
+      this.usingSharedContext = true
+
+      this.startAudioWorklet(context, source, sink)
       this.captureEngine = 'audio-worklet'
+      return this.captureEngine
     } catch (error) {
       console.warn(
-        '[Home Voice Agent] AudioWorklet prebuffer unavailable, using ScriptProcessor fallback',
+        '[Home Voice Agent] Prewarmed AudioWorklet unavailable, using ScriptProcessor fallback',
         error,
       )
+
+      this.stopNodes()
+      this.usingSharedContext = false
+      this.workletPrewarmed = false
+
+      const context = new AudioContext({ latencyHint: 'interactive' })
+      const source = context.createMediaStreamSource(this.stream)
+      const sink = context.createGain()
+      sink.gain.value = 0
+
+      if (context.state === 'suspended') {
+        await context.resume()
+      }
+
+      this.context = context
+      this.source = source
+      this.sink = sink
       this.startScriptProcessorFallback(context, source, sink)
       this.captureEngine = 'script-processor-fallback'
+      return this.captureEngine
     }
-
-    return this.captureEngine
   }
 
   async stopAndTake(): Promise<WakeAudioPrebufferResult> {
@@ -153,15 +250,17 @@ export class WakeAudioPrebuffer {
 
     const result = this.trimLeadingSilence(originalChunks)
     const context = this.context
+    const shouldCloseContext = context && !this.usingSharedContext
     this.context = null
 
-    if (context && context.state !== 'closed') {
+    if (shouldCloseContext && context.state !== 'closed') {
       await context.close().catch(() => undefined)
     }
 
     return {
       ...result,
       captureEngine: this.captureEngine,
+      workletPrewarmed: this.workletPrewarmed,
     }
   }
 
@@ -171,24 +270,11 @@ export class WakeAudioPrebuffer {
     await this.stopAndTake()
   }
 
-  private async startAudioWorklet(
+  private startAudioWorklet(
     context: AudioContext,
     source: MediaStreamAudioSourceNode,
     sink: GainNode,
-  ): Promise<void> {
-    if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
-      throw new Error('AudioWorklet is not supported by this browser.')
-    }
-
-    const module = new Blob([WORKLET_SOURCE], { type: 'text/javascript' })
-    const moduleUrl = URL.createObjectURL(module)
-
-    try {
-      await context.audioWorklet.addModule(moduleUrl)
-    } finally {
-      URL.revokeObjectURL(moduleUrl)
-    }
-
+  ): void {
     const worklet = new AudioWorkletNode(context, 'home-voice-wake-prebuffer', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -225,7 +311,7 @@ export class WakeAudioPrebuffer {
     source: MediaStreamAudioSourceNode,
     sink: GainNode,
   ): void {
-    const processor = context.createScriptProcessor(2048, 1, 1)
+    const processor = context.createScriptProcessor(1024, 1, 1)
     let emittedFirstChunk = false
 
     processor.onaudioprocess = event => {
@@ -320,9 +406,12 @@ export class WakeAudioPrebuffer {
     }
   }
 
-  private trimLeadingSilence(chunks: BufferedChunk[]): Omit<WakeAudioPrebufferResult, 'captureEngine'> {
+  private trimLeadingSilence(chunks: BufferedChunk[]): Omit<WakeAudioPrebufferResult, 'captureEngine' | 'workletPrewarmed'> {
     const originalSamples = chunks.reduce((sum, chunk) => sum + chunk.samples, 0)
     const originalAudioMs = this.samplesToMs(originalSamples)
+    const finiteRms = chunks.map(chunk => chunk.rmsDb).filter(value => Number.isFinite(value))
+    const maxRmsDb = finiteRms.length > 0 ? Math.max(...finiteRms) : null
+    const maxPeak = chunks.length > 0 ? Math.max(...chunks.map(chunk => chunk.peak)) : null
 
     if (chunks.length < 3 || originalSamples === 0) {
       return {
@@ -333,19 +422,20 @@ export class WakeAudioPrebuffer {
         firstSpeechOffsetMs: null,
         noiseFloorDb: null,
         speechThresholdDb: null,
+        maxRmsDb: maxRmsDb === null ? null : Math.round(maxRmsDb * 10) / 10,
+        maxPeak: maxPeak === null ? null : Math.round(maxPeak * 1000) / 1000,
       }
     }
 
-    const rmsValues = chunks
-      .map(chunk => chunk.rmsDb)
-      .filter(value => Number.isFinite(value))
-      .sort((a, b) => a - b)
+    const rmsValues = [...finiteRms].sort((a, b) => a - b)
 
     const noiseFloorDb = rmsValues.length > 0
       ? rmsValues[Math.min(rmsValues.length - 1, Math.floor(rmsValues.length * 0.2))]!
       : -60
 
-    const speechThresholdDb = Math.max(-46, Math.min(-30, noiseFloorDb + 8))
+    // The local detector only decides how much leading silence to trim. Be more
+    // permissive than Realtime so quiet but genuine speech is never discarded.
+    const speechThresholdDb = Math.max(-58, Math.min(-32, noiseFloorDb + 8))
     const requiredRunSamples = Math.round((this.targetSampleRate * MIN_SPEECH_RUN_MS) / 1000)
 
     let firstSpeechIndex: number | null = null
@@ -354,7 +444,7 @@ export class WakeAudioPrebuffer {
 
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]!
-      const active = chunk.rmsDb >= speechThresholdDb || chunk.peak >= 0.1
+      const active = chunk.rmsDb >= speechThresholdDb || chunk.peak >= 0.035
 
       if (active) {
         if (activeRunSamples === 0) activeRunStart = index
@@ -378,6 +468,8 @@ export class WakeAudioPrebuffer {
         firstSpeechOffsetMs: null,
         noiseFloorDb: Math.round(noiseFloorDb * 10) / 10,
         speechThresholdDb: Math.round(speechThresholdDb * 10) / 10,
+        maxRmsDb: maxRmsDb === null ? null : Math.round(maxRmsDb * 10) / 10,
+        maxPeak: maxPeak === null ? null : Math.round(maxPeak * 1000) / 1000,
       }
     }
 
@@ -409,6 +501,8 @@ export class WakeAudioPrebuffer {
       firstSpeechOffsetMs,
       noiseFloorDb: Math.round(noiseFloorDb * 10) / 10,
       speechThresholdDb: Math.round(speechThresholdDb * 10) / 10,
+      maxRmsDb: maxRmsDb === null ? null : Math.round(maxRmsDb * 10) / 10,
+      maxPeak: maxPeak === null ? null : Math.round(maxPeak * 1000) / 1000,
     }
   }
 

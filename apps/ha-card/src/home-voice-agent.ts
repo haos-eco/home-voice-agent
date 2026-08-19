@@ -1014,10 +1014,11 @@ export class HomeVoiceAgentController {
               },
               transcription: {
                 model: 'gpt-4o-mini-transcribe',
+                language: 'it',
               },
               turnDetection: {
                 type: 'semantic_vad',
-                eagerness: 'medium',
+                eagerness: 'high',
                 createResponse: true,
                 interruptResponse: true,
               },
@@ -1120,20 +1121,20 @@ export class HomeVoiceAgentController {
       this.setState('listening')
       this.resetInactivityTimer()
 
-      console.debug(
-        '[Home Voice Agent] Wake audio prebuffer flushed',
-        JSON.stringify({
-          engine: buffered?.captureEngine ?? 'none',
-          chunks: bufferedAudio.length,
-          bytes: bufferedBytes,
-          originalAudioMs: buffered?.originalAudioMs ?? 0,
-          audioMs: buffered?.audioMs ?? 0,
-          trimmedLeadingMs: buffered?.trimmedLeadingMs ?? 0,
-          firstSpeechOffsetMs: buffered?.firstSpeechOffsetMs ?? null,
-          noiseFloorDb: buffered?.noiseFloorDb ?? null,
-          speechThresholdDb: buffered?.speechThresholdDb ?? null,
-        }),
-      )
+      console.debug('[Home Voice Agent] Wake audio prebuffer flushed', {
+        engine: buffered?.captureEngine ?? 'none',
+        chunks: bufferedAudio.length,
+        bytes: bufferedBytes,
+        originalAudioMs: buffered?.originalAudioMs ?? 0,
+        audioMs: buffered?.audioMs ?? 0,
+        trimmedLeadingMs: buffered?.trimmedLeadingMs ?? 0,
+        firstSpeechOffsetMs: buffered?.firstSpeechOffsetMs ?? null,
+        noiseFloorDb: buffered?.noiseFloorDb ?? null,
+        speechThresholdDb: buffered?.speechThresholdDb ?? null,
+        maxRmsDb: buffered?.maxRmsDb ?? null,
+        maxPeak: buffered?.maxPeak ?? null,
+        workletPrewarmed: buffered?.workletPrewarmed ?? false,
+      })
 
       void Promise.allSettled([memoryPreparation, homeAreasPreparation]).then(() => {
         if (this.session === session) {

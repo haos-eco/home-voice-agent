@@ -1,4 +1,5 @@
 import { HomeVoiceAgentController, type VoiceAgentState } from './home-voice-agent.js'
+import { prewarmWakeAudioWorklet } from './wake-audio-prebuffer.js'
 
 type KioskWakeModel = {
   id: string
@@ -96,6 +97,11 @@ if (!window.homeVoiceAgent) {
 }
 
 const agent = window.homeVoiceAgent
+
+// Load the AudioWorklet module while Kiosk Satellite still owns the microphone.
+// No microphone permission or capture is requested here; this only removes
+// AudioContext/worklet module startup from the post-wake critical path.
+void prewarmWakeAudioWorklet()
 
 /*
  * Before the browser voice agent starts using the microphone,
