@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 import { config } from './config.js'
 
@@ -84,28 +84,49 @@ export async function createRealtimeClientSecret(): Promise<unknown> {
   }
 }
 
+function buildRealtimeCallMultipart(sdpOffer: string): {
+  boundary: string
+  body: Uint8Array
+} {
+  const boundary = `----home-voice-agent-${randomUUID()}`
+  const session = JSON.stringify(baseRealtimeSessionConfig())
+
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="sdp"\r\n' +
+        'Content-Type: application/sdp\r\n\r\n',
+      'utf8',
+    ),
+    Buffer.from(sdpOffer, 'utf8'),
+    Buffer.from(
+      `\r\n--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="session"\r\n' +
+        'Content-Type: application/json\r\n\r\n' +
+        session +
+        `\r\n--${boundary}--\r\n`,
+      'utf8',
+    ),
+  ])
+
+  return {
+    boundary,
+    body: new Uint8Array(body),
+  }
+}
+
 export async function createRealtimeCall(sdpOffer: string): Promise<RealtimeCallResult> {
   const apiKey = requireOpenAIKey()
-
-  const form = new FormData()
-  form.append(
-    'sdp',
-    new Blob([sdpOffer], { type: 'application/sdp' }),
-    'offer.sdp',
-  )
-  form.append(
-    'session',
-    new Blob([JSON.stringify(baseRealtimeSessionConfig())], { type: 'application/json' }),
-    'session.json',
-  )
+  const multipart = buildRealtimeCallMultipart(sdpOffer)
 
   const response = await fetch(OPENAI_REALTIME_CALLS_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'OpenAI-Safety-Identifier': createSafetyIdentifier(),
+      'Content-Type': `multipart/form-data; boundary=${multipart.boundary}`,
     },
-    body: form,
+    body: multipart.body,
     signal: AbortSignal.timeout(15_000),
   })
 
