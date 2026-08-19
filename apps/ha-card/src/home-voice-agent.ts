@@ -945,8 +945,12 @@ export class HomeVoiceAgentController {
           this.markStartupTraceOnce('prebuffer_first_audio')
         })
         this.wakeAudioPrebuffer = prebuffer
-        await prebuffer.start()
+        const prebufferEngine = await prebuffer.start()
         this.markStartupTrace('prebuffer_started')
+
+        console.debug('[Home Voice Agent] Wake audio prebuffer ready', {
+          engine: prebufferEngine,
+        })
 
         const sourceTrack = stream.getAudioTracks()[0]
         if (!sourceTrack) {
@@ -1100,9 +1104,10 @@ export class HomeVoiceAgentController {
       // RTP audio from overtaking the buffered beginning of the command.
       const prebuffer = this.wakeAudioPrebuffer
       this.markStartupTrace('prebuffer_flush_started')
-      const bufferedAudio = prebuffer ? await prebuffer.stopAndTake() : []
+      const buffered = prebuffer ? await prebuffer.stopAndTake() : null
       this.wakeAudioPrebuffer = null
 
+      const bufferedAudio = buffered?.chunks ?? []
       let bufferedBytes = 0
       for (const chunk of bufferedAudio) {
         bufferedBytes += chunk.byteLength
@@ -1118,9 +1123,15 @@ export class HomeVoiceAgentController {
       console.debug(
         '[Home Voice Agent] Wake audio prebuffer flushed',
         JSON.stringify({
+          engine: buffered?.captureEngine ?? 'none',
           chunks: bufferedAudio.length,
           bytes: bufferedBytes,
-          audioMs: Math.round((bufferedBytes / 2 / 24_000) * 1000),
+          originalAudioMs: buffered?.originalAudioMs ?? 0,
+          audioMs: buffered?.audioMs ?? 0,
+          trimmedLeadingMs: buffered?.trimmedLeadingMs ?? 0,
+          firstSpeechOffsetMs: buffered?.firstSpeechOffsetMs ?? null,
+          noiseFloorDb: buffered?.noiseFloorDb ?? null,
+          speechThresholdDb: buffered?.speechThresholdDb ?? null,
         }),
       )
 

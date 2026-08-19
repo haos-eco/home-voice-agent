@@ -202,7 +202,7 @@ if (!window.__homeVoiceAgentKioskWakeConfigured && !window.__homeVoiceAgentKiosk
 }
 
 console.info(
-  '%c HOME VOICE AGENT %c v0.7.0 %c',
+  '%c HOME VOICE AGENT %c v0.7.2 %c',
   'color:#fff;background:#596d87;font-weight:700;padding:3px 6px',
   'color:#596d87;background:#fff;font-weight:700;padding:3px 6px',
 )
